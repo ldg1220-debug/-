@@ -4,6 +4,10 @@
   - RANGE: 그리드 주문 (N레벨 × 양방향, 현재가 기준 균등 배치)
   - 손절 후 쿨다운 (연속 fakeout 방지)
   - ATR 기반 동적 스탑 (변동성 연동) + 데이터 부족 시 고정 % 폴백
+  - 박스권 30분 캐싱
+  - GridOrder 체결 추적
+  - 조용한 가격 이탈 방어 (WATCHING 모드)
+  - 리스크 기반 포지션 사이징
 
 기존 5단계 구조 유지:
   단계 1: 48h 박스권 + 그리드 지정가 Payload
@@ -37,6 +41,7 @@ VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "3.0"))
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.005"))
 
 BOX_48H_CANDLES = 48 * 60          # 2880개 1분봉
+BOX_CACHE_SECONDS = int(os.getenv("BOX_CACHE_SECONDS", "1800"))  # 30분 캐싱
 
 # 그리드 설정
 N_GRID_LEVELS = int(os.getenv("N_GRID_LEVELS", "3"))  # 양방향 각 N단계
@@ -53,6 +58,9 @@ ATR_MULTIPLIER_SL = float(os.getenv("ATR_MULTIPLIER_SL", "1.0"))
 TRAILING_STOP_PCT = 0.02
 STOP_LOSS_PCT = 0.015
 
+# 리스크 기반 포지션 사이징
+MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.02"))
+
 
 # ── 데이터 모델 ──────────────────────────────────────────────────────────────
 
@@ -60,6 +68,20 @@ class StrategyMode(Enum):
     RANGE = auto()
     BREAKOUT_LONG = auto()
     BREAKOUT_SHORT = auto()
+    WATCHING = auto()
+
+
+@dataclass
+class GridOrder:
+    order_id: str
+    side: str           # "BUY" | "SELL"
+    price: float
+    size: float
+    level: int          # 0-indexed
+    grid_step: float    # TP 주문 간격
+    is_tp: bool = False
+    status: str = "OPEN"   # OPEN | FILLED | CANCELLED
+    tp_order_id: str = ""
 
 
 @dataclass
@@ -151,11 +173,13 @@ class BreakoutPosition:
 class EngineAState:
     mode: StrategyMode = StrategyMode.RANGE
     box: BoxRange | None = None
-    open_order_ids: list[str] = field(default_factory=list)
+    open_order_ids: list = field(default_factory=list)
     allocated_capital: float = 0.0
     realized_pnl: float = 0.0
     position: BreakoutPosition | None = None
     cooldown_until: float = 0.0       # Unix timestamp; 0 = 쿨다운 없음
+    box_last_updated: float = 0.0     # 박스권 캐싱 타임스탬프
+    grid_orders: list = field(default_factory=list)  # list[GridOrder]
 
 
 # ── 메인 엔진 ────────────────────────────────────────────────────────────────
@@ -199,7 +223,16 @@ class EngineA:
     # ── 단계 1: 48시간 박스권 + 그리드 주문 ──────────────────────────────────
 
     def calculate_box_48h(self, market: MarketData) -> BoxRange:
-        """48시간 최고가/최저가로 저항선/지지선을 계산합니다."""
+        """48시간 최고가/최저가로 저항선/지지선을 계산합니다. 30분 캐싱 적용."""
+        # 캐시 유효 여부 확인
+        if (
+            self.state.box is not None
+            and time.time() - self.state.box_last_updated < BOX_CACHE_SECONDS
+        ):
+            logger.debug("[박스권] 캐시 반환 (%.0f초 전 계산)", time.time() - self.state.box_last_updated)
+            return self.state.box
+
+        # 재계산
         candles = list(market.candles)[-BOX_48H_CANDLES:]
         if len(candles) < 2:
             raise ValueError(f"박스권 계산에 필요한 캔들 부족: {len(candles)}개 (최소 2)")
@@ -207,43 +240,66 @@ class EngineA:
             support=min(c.low for c in candles),
             resistance=max(c.high for c in candles),
         )
+        self.state.box = box
+        self.state.box_last_updated = time.time()
         logger.debug(
             "[박스권] support=%.2f  resistance=%.2f  width=%.4f  (캔들 %d개)",
             box.support, box.resistance, box.width, len(candles),
         )
         return box
 
+    def invalidate_box_cache(self) -> None:
+        """박스권 캐시를 무효화합니다. 다음 calculate_box_48h 호출 시 재계산."""
+        self.state.box_last_updated = 0.0
+        logger.debug("[박스권] 캐시 무효화")
+
     def _build_grid_levels(
         self, box: BoxRange, capital: float, price: float
-    ) -> list[tuple[str, float, float]]:
+    ) -> list:
         """현재가 기준으로 균등한 그리드 주문 레벨 목록을 생성합니다.
 
         BUY: 현재가 아래 → 지지선 방향으로 N단계
         SELL: 현재가 위  → 저항선 방향으로 N단계
 
         Returns:
-            [(side, level_price, size), ...]
+            list[GridOrder]
         """
-        levels: list[tuple[str, float, float]] = []
+        levels: list = []
         per_level_capital = capital / (N_GRID_LEVELS * 2)
 
         # BUY 레벨 (현재가 ~ 지지선 사이 균등 분할)
         buy_range = price - box.support
+        buy_step = buy_range / (N_GRID_LEVELS + 1) if buy_range > 0 else 0
         if buy_range > 0:
-            step = buy_range / (N_GRID_LEVELS + 1)
             for i in range(1, N_GRID_LEVELS + 1):
-                lp = round(price - step * i, 2)
+                lp = round(price - buy_step * i, 2)
                 if lp > box.support:
-                    levels.append(("BUY", lp, per_level_capital / lp))
+                    size = per_level_capital / lp
+                    levels.append(GridOrder(
+                        order_id="",
+                        side="BUY",
+                        price=lp,
+                        size=size,
+                        level=i - 1,
+                        grid_step=buy_step,
+                    ))
 
         # SELL 레벨 (현재가 ~ 저항선 사이 균등 분할)
         sell_range = box.resistance - price
+        sell_step = sell_range / (N_GRID_LEVELS + 1) if sell_range > 0 else 0
         if sell_range > 0:
-            step = sell_range / (N_GRID_LEVELS + 1)
             for i in range(1, N_GRID_LEVELS + 1):
-                lp = round(price + step * i, 2)
+                lp = round(price + sell_step * i, 2)
                 if lp < box.resistance:
-                    levels.append(("SELL", lp, per_level_capital / lp))
+                    size = per_level_capital / lp
+                    levels.append(GridOrder(
+                        order_id="",
+                        side="SELL",
+                        price=lp,
+                        size=size,
+                        level=i - 1,
+                        grid_step=sell_step,
+                    ))
 
         return levels
 
@@ -291,10 +347,12 @@ class EngineA:
 
         grid = self._build_grid_levels(box, capital, price)
         placed = 0
-        for side, level_price, size in grid:
-            payload = self._build_limit_payload(side, level_price, size)
+        for order in grid:
+            payload = self._build_limit_payload(order.side, order.price, order.size)
             oid = self._send_order(payload)
             if oid:
+                order.order_id = oid
+                self.state.grid_orders.append(order)
                 self.state.open_order_ids.append(oid)
                 placed += 1
 
@@ -305,6 +363,88 @@ class EngineA:
             box.resistance,
             f"{self._calculate_atr(market):.4f}" if self._calculate_atr(market) else "N/A",
         )
+
+    # ── 그리드 체결 추적 ──────────────────────────────────────────────────────
+
+    def _check_grid_fills(self, market: MarketData) -> None:
+        """그리드 주문 체결 여부를 확인합니다."""
+        if self.dry_run:
+            self._simulate_fills(market)
+        else:
+            for order in list(self.state.grid_orders):
+                if order.status == "OPEN" and not order.is_tp:
+                    status = self._query_order_status(order.order_id)
+                    if status == "FILLED":
+                        order.status = "FILLED"
+                        if order.order_id in self.state.open_order_ids:
+                            self.state.open_order_ids.remove(order.order_id)
+                        self._place_grid_tp_order(order)
+
+    def _simulate_fills(self, market: MarketData) -> None:
+        """드라이런 시 가격 기반 체결 시뮬레이션."""
+        price = market.last_price
+        for order in list(self.state.grid_orders):
+            if order.status != "OPEN":
+                continue
+            filled = False
+            if order.side == "BUY" and price <= order.price:
+                filled = True
+            elif order.side == "SELL" and price >= order.price:
+                filled = True
+
+            if filled:
+                order.status = "FILLED"
+                if order.order_id in self.state.open_order_ids:
+                    self.state.open_order_ids.remove(order.order_id)
+                logger.info(
+                    "[시뮬] %s 체결: %s @ %.2f (현재가=%.2f)",
+                    order.order_id, order.side, order.price, price,
+                )
+                self._place_grid_tp_order(order)
+
+    def _place_grid_tp_order(self, filled_order: GridOrder) -> None:
+        """체결된 그리드 주문에 대한 TP 주문을 배치합니다."""
+        if filled_order.side == "BUY":
+            tp_side = "SELL"
+            tp_price = round(filled_order.price + filled_order.grid_step, 2)
+        else:
+            tp_side = "BUY"
+            tp_price = round(filled_order.price - filled_order.grid_step, 2)
+
+        payload = self._build_limit_payload(tp_side, tp_price, filled_order.size)
+        tp_oid = self._send_order(payload)
+        if tp_oid:
+            tp_order = GridOrder(
+                order_id=tp_oid,
+                side=tp_side,
+                price=tp_price,
+                size=filled_order.size,
+                level=filled_order.level,
+                grid_step=filled_order.grid_step,
+                is_tp=True,
+            )
+            self.state.grid_orders.append(tp_order)
+            self.state.open_order_ids.append(tp_oid)
+            filled_order.tp_order_id = tp_oid
+            logger.info(
+                "[TP] %s TP 주문 배치: %s @ %.2f (원 주문: %s)",
+                filled_order.order_id, tp_side, tp_price, tp_oid,
+            )
+
+    def _query_order_status(self, order_id: str) -> str | None:
+        """edgeX API에서 주문 상태를 조회합니다.
+        TODO: 실제 API 엔드포인트로 교체 필요.
+        """
+        try:
+            resp = self._session.get(
+                f"{EDGEX_API_URL}/api/v1/order/{order_id}", timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("status")
+        except Exception as exc:
+            logger.error("주문 상태 조회 실패 %s: %s", order_id, exc)
+            return None
 
     # ── 단계 2: 거래량 Spike 감시 + 비상 전량 취소 + 상태 전환 ──────────────
 
@@ -340,11 +480,30 @@ class EngineA:
             if self._cancel_order(oid):
                 self.state.open_order_ids.remove(oid)
                 cancelled += 1
+
+        # grid_orders 상태도 CANCELLED로 업데이트
+        for order in self.state.grid_orders:
+            if order.status == "OPEN":
+                order.status = "CANCELLED"
+
         logger.info("🗑️  전량 취소 완료: %d건", cancelled)
         return cancelled
 
+    def _handle_silent_breakout(self, market: MarketData) -> None:
+        """거래량 없는 조용한 가격 이탈 처리."""
+        if self.state.open_order_ids:
+            self.cancel_all_orders()
+        self.invalidate_box_cache()
+        self.state.mode = StrategyMode.WATCHING
+        logger.warning(
+            "🔕 조용한 가격 이탈 감지 → 그리드 취소 + WATCHING 모드 전환 (price=%.2f)",
+            market.last_price,
+        )
+
     def _execute_emergency_switch(self, direction: str, market: MarketData) -> None:
         self.cancel_all_orders()
+        self.state.grid_orders.clear()
+        self.state.open_order_ids.clear()
         self.state.mode = (
             StrategyMode.BREAKOUT_LONG if direction == "LONG"
             else StrategyMode.BREAKOUT_SHORT
@@ -400,28 +559,36 @@ class EngineA:
             return
 
         side = "BUY" if self.state.mode == StrategyMode.BREAKOUT_LONG else "SELL"
-        size = capital / price
 
-        # ── ATR 기반 동적 스탑 계산 ──────────────────────────────────────────
+        # ── ATR 기반 동적 스탑 계산 + 리스크 기반 사이징 ────────────────────
         atr = self._calculate_atr(market)
+        max_risk_usdc = capital * MAX_RISK_PER_TRADE_PCT
+
         if atr:
-            trailing_dist = round(atr * ATR_MULTIPLIER_TRAILING, 4)
             sl_dist = round(atr * ATR_MULTIPLIER_SL, 4)
+            trailing_dist = round(atr * ATR_MULTIPLIER_TRAILING, 4)
+            size = max_risk_usdc / sl_dist
+            size = min(size, capital / price)
             logger.info(
-                "📐 ATR=%.4f → 트레일링=%.4f(%.2f%%)  손절=%.4f(%.2f%%)",
+                "📐 ATR=%.4f → 트레일링=%.4f(%.2f%%)  손절=%.4f(%.2f%%)  size=%.6f",
                 atr,
                 trailing_dist, trailing_dist / price * 100,
                 sl_dist, sl_dist / price * 100,
+                size,
             )
         else:
             # 데이터 부족 → 고정 % 폴백
             trailing_dist = 0.0
             sl_dist = 0.0
+            sl_dist_fallback = price * STOP_LOSS_PCT
+            size = max_risk_usdc / sl_dist_fallback
+            size = min(size, capital / price)
             logger.warning(
-                "ATR 계산 불가 (캔들 %d개) → 고정 %% 스탑 사용 (trailing=%.1f%% sl=%.1f%%)",
+                "ATR 계산 불가 (캔들 %d개) → 고정 %% 스탑 사용 (trailing=%.1f%% sl=%.1f%%) size=%.6f",
                 len(list(market.candles)),
                 TRAILING_STOP_PCT * 100,
                 STOP_LOSS_PCT * 100,
+                size,
             )
 
         payload = self._build_market_payload(side, size, price)
@@ -506,6 +673,7 @@ class EngineA:
 
         self.state.position = None
         self.state.mode = StrategyMode.RANGE
+        self.state.grid_orders.clear()
         self.state.open_order_ids.clear()
         logger.info("🔄 RANGE 복귀%s", " (쿨다운 중)" if self._is_in_cooldown() else "")
 
@@ -513,17 +681,32 @@ class EngineA:
 
     async def on_market_update(self, market: MarketData) -> None:
         async with self._state_lock:
-            # 1. 리스크 체크 최우선
             self._check_exit_conditions(market)
 
-            mode = self.state.mode
+            if self.state.mode in (StrategyMode.RANGE, StrategyMode.WATCHING):
+                self._check_grid_fills(market)
 
-            # 2. RANGE → Spike 감지
-            if mode == StrategyMode.RANGE and self.is_volume_spike(market):
+            mode = self.state.mode
+            spike = self.is_volume_spike(market) if mode == StrategyMode.RANGE else False
+
+            # 조용한 이탈 방어
+            if mode == StrategyMode.RANGE and self.state.box:
+                if not self.state.box.is_inside(market.last_price) and not spike:
+                    self._handle_silent_breakout(market)
+                    return
+
+            # WATCHING 모드: 박스 복귀 시 RANGE 재개
+            if mode == StrategyMode.WATCHING:
+                if self.state.box and self.state.box.is_inside(market.last_price):
+                    logger.info("📦 가격 박스권 복귀 → RANGE 재개")
+                    self.state.mode = StrategyMode.RANGE
+                    mode = StrategyMode.RANGE
+                else:
+                    return
+
+            if mode == StrategyMode.RANGE and spike:
                 direction = self._determine_breakout_direction(market)
                 self._execute_emergency_switch(direction, market)
-
-            # 3. RANGE & 미체결 없음 & 쿨다운 아님 → 그리드 주문
             elif mode == StrategyMode.RANGE and not self.state.open_order_ids:
                 self.place_range_orders(market)
 

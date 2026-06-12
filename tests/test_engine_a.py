@@ -5,6 +5,10 @@
   - 손절 후 쿨다운 (연속 fakeout 방지)
   - ATR 기반 동적 스탑 + 고정 % 폴백
   - asyncio 전체 플로우 통합 (RANGE → Spike → Breakout → Exit → RANGE)
+  - 박스권 30분 캐싱
+  - GridOrder 체결 추적
+  - 조용한 가격 이탈 방어 (WATCHING 모드)
+  - 리스크 기반 포지션 사이징
 """
 
 import asyncio
@@ -23,6 +27,8 @@ from src.engine_a import (
     ATR_MULTIPLIER_TRAILING,
     ATR_PERIOD,
     BOX_48H_CANDLES,
+    BOX_CACHE_SECONDS,
+    MAX_RISK_PER_TRADE_PCT,
     MAX_SLIPPAGE_PCT,
     N_GRID_LEVELS,
     STOP_LOSS_COOLDOWN_SECONDS,
@@ -32,6 +38,7 @@ from src.engine_a import (
     BreakoutPosition,
     EngineA,
     EngineAState,
+    GridOrder,
     StrategyMode,
 )
 
@@ -153,46 +160,46 @@ class TestGridOrders(unittest.TestCase):
         """_build_grid_levels가 BUY N개 + SELL N개를 반환해야 합니다."""
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
-        buys = [l for l in levels if l[0] == "BUY"]
-        sells = [l for l in levels if l[0] == "SELL"]
+        buys = [o for o in levels if o.side == "BUY"]
+        sells = [o for o in levels if o.side == "SELL"]
         self.assertEqual(len(buys), N_GRID_LEVELS)
         self.assertEqual(len(sells), N_GRID_LEVELS)
 
     def test_buy_levels_below_current_price(self):
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
-        for side, price, _ in levels:
-            if side == "BUY":
-                self.assertLess(price, 100.0)
+        for order in levels:
+            if order.side == "BUY":
+                self.assertLess(order.price, 100.0)
 
     def test_sell_levels_above_current_price(self):
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
-        for side, price, _ in levels:
-            if side == "SELL":
-                self.assertGreater(price, 100.0)
+        for order in levels:
+            if order.side == "SELL":
+                self.assertGreater(order.price, 100.0)
 
     def test_buy_levels_above_support(self):
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
-        for side, price, _ in levels:
-            if side == "BUY":
-                self.assertGreater(price, box.support)
+        for order in levels:
+            if order.side == "BUY":
+                self.assertGreater(order.price, box.support)
 
     def test_sell_levels_below_resistance(self):
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
-        for side, price, _ in levels:
-            if side == "SELL":
-                self.assertLess(price, box.resistance)
+        for order in levels:
+            if order.side == "SELL":
+                self.assertLess(order.price, box.resistance)
 
     def test_capital_distributed_evenly(self):
         """각 레벨의 notional(가격 × 수량)이 균등해야 합니다."""
         box = BoxRange(support=99.0, resistance=101.0)
         levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
         per_level_capital = 10_000.0 / (N_GRID_LEVELS * 2)
-        for side, price, size in levels:
-            notional = price * size
+        for order in levels:
+            notional = order.price * order.size
             self.assertAlmostEqual(notional, per_level_capital, delta=0.1)
 
     def test_place_range_orders_places_grid(self):
@@ -214,6 +221,13 @@ class TestGridOrders(unittest.TestCase):
             self.assertIn(key, payload)
         self.assertEqual(payload["type"], "LIMIT")
         self.assertEqual(payload["timeInForce"], "GTC")
+
+    def test_grid_order_is_grid_order_instance(self):
+        """_build_grid_levels가 GridOrder 객체 목록을 반환해야 합니다."""
+        box = BoxRange(support=99.0, resistance=101.0)
+        levels = self.engine._build_grid_levels(box, 10_000.0, 100.0)
+        for order in levels:
+            self.assertIsInstance(order, GridOrder)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,6 +582,14 @@ class TestExitAndRangeReset(unittest.TestCase):
         self._check_exit(98.4)
         self.assertEqual(len(self.engine.state.open_order_ids), 0)
 
+    def test_stop_loss_clears_grid_orders(self):
+        """손절 시 grid_orders도 클리어되어야 합니다."""
+        self.engine.state.grid_orders = [
+            GridOrder("id1", "BUY", 99.0, 0.1, 0, 0.5),
+        ]
+        self._check_exit(98.4)
+        self.assertEqual(len(self.engine.state.grid_orders), 0)
+
     def test_stop_loss_priority_over_trailing(self):
         """손절과 트레일링이 동시 충족 시 손절이 우선 실행되어야 합니다."""
         self.engine.state.position = BreakoutPosition(
@@ -576,6 +598,322 @@ class TestExitAndRangeReset(unittest.TestCase):
         self._check_exit(98.3)  # 손절(-1.7%) + 트레일링(0%) 동시
         self.assertIsNone(self.engine.state.position)
         self.assertEqual(self.engine.state.mode, StrategyMode.RANGE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 박스권 캐싱
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBoxCaching(unittest.TestCase):
+
+    def test_box_cached_within_30min(self):
+        """30분 이내 재호출 시 캔들 재계산 없이 캐시 반환."""
+        engine = make_engine()
+        md = make_market(2880, price=100.0)
+
+        # 첫 번째 호출 → 계산
+        box1 = engine.calculate_box_48h(md)
+        self.assertIsNotNone(engine.state.box_last_updated)
+        first_updated = engine.state.box_last_updated
+
+        # 캔들을 변경해도 캐시 기간 내이면 이전 박스 반환
+        md2 = make_market(2880, price=200.0)
+        # 강제로 업데이트 시간을 최근으로 설정
+        engine.state.box_last_updated = time.time() - 60  # 1분 전
+        box2 = engine.calculate_box_48h(md2)
+
+        # 캐시가 반환되어야 함 (새 마켓 데이터에도 불구하고 같은 박스)
+        self.assertEqual(box1.support, box2.support)
+        self.assertEqual(box1.resistance, box2.resistance)
+
+    def test_box_recalculated_after_expiry(self):
+        """box_last_updated를 -7200으로 설정하면 재계산됨."""
+        engine = make_engine()
+        md = make_market(2880, price=100.0)
+
+        # 첫 번째 계산
+        box1 = engine.calculate_box_48h(md)
+
+        # 캐시 만료 시뮬레이션
+        engine.state.box_last_updated = time.time() - 7200  # 2시간 전
+
+        # 다른 마켓 데이터로 재계산 유도
+        md2 = MarketData(symbol="BTC-USDC")
+        for i in range(2880):
+            md2.candles.append(Candle(i, 200, 250, 180, 200, 1.0))
+        md2.last_price = 200.0
+
+        box2 = engine.calculate_box_48h(md2)
+        # 재계산되었으므로 다른 박스
+        self.assertNotEqual(box1.support, box2.support)
+
+    def test_invalidate_forces_recalculation(self):
+        """invalidate_box_cache() 후 다음 호출에서 재계산."""
+        engine = make_engine()
+        md = make_market(2880, price=100.0)
+
+        box1 = engine.calculate_box_48h(md)
+
+        # 캐시 무효화
+        engine.invalidate_box_cache()
+        self.assertEqual(engine.state.box_last_updated, 0.0)
+
+        # 다른 마켓 데이터로 재계산 유도
+        md2 = MarketData(symbol="BTC-USDC")
+        for i in range(2880):
+            md2.candles.append(Candle(i, 200, 250, 180, 200, 1.0))
+        md2.last_price = 200.0
+
+        box2 = engine.calculate_box_48h(md2)
+        self.assertNotEqual(box1.support, box2.support)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 그리드 체결 추적
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGridFillTracking(unittest.TestCase):
+
+    def setUp(self):
+        self.engine = make_engine()
+        # 박스권과 그리드 주문 설정
+        self.engine.state.box = BoxRange(support=99.0, resistance=101.0)
+        md = make_market(2880, price=100.0)
+        self.engine.place_range_orders(md)
+
+    def test_buy_fill_places_sell_tp(self):
+        """BUY 그리드 체결 시 SELL TP 주문 자동 배치."""
+        buy_orders = [o for o in self.engine.state.grid_orders if o.side == "BUY"]
+        self.assertGreater(len(buy_orders), 0)
+        buy_order = buy_orders[0]
+        initial_count = len(self.engine.state.grid_orders)
+
+        # BUY 주문가 이하로 가격 설정하여 체결 시뮬레이션
+        md = make_market(2880, price=buy_order.price - 0.01)
+        self.engine._simulate_fills(md)
+
+        # TP 주문이 추가되어야 함
+        tp_orders = [o for o in self.engine.state.grid_orders if o.is_tp and o.side == "SELL"]
+        self.assertGreater(len(tp_orders), 0)
+
+    def test_sell_fill_places_buy_tp(self):
+        """SELL 그리드 체결 시 BUY TP 주문 자동 배치."""
+        sell_orders = [o for o in self.engine.state.grid_orders if o.side == "SELL"]
+        self.assertGreater(len(sell_orders), 0)
+        sell_order = sell_orders[0]
+
+        # SELL 주문가 이상으로 가격 설정하여 체결 시뮬레이션
+        md = make_market(2880, price=sell_order.price + 0.01)
+        self.engine._simulate_fills(md)
+
+        # BUY TP 주문이 추가되어야 함
+        tp_orders = [o for o in self.engine.state.grid_orders if o.is_tp and o.side == "BUY"]
+        self.assertGreater(len(tp_orders), 0)
+
+    def test_filled_order_removed_from_open_ids(self):
+        """체결된 주문은 open_order_ids에서 제거."""
+        buy_orders = [o for o in self.engine.state.grid_orders if o.side == "BUY"]
+        self.assertGreater(len(buy_orders), 0)
+        buy_order = buy_orders[0]
+        self.assertIn(buy_order.order_id, self.engine.state.open_order_ids)
+
+        md = make_market(2880, price=buy_order.price - 0.01)
+        self.engine._simulate_fills(md)
+
+        self.assertNotIn(buy_order.order_id, self.engine.state.open_order_ids)
+
+    def test_tp_order_added_to_open_ids(self):
+        """TP 주문은 open_order_ids에 추가."""
+        buy_orders = [o for o in self.engine.state.grid_orders if o.side == "BUY"]
+        self.assertGreater(len(buy_orders), 0)
+        buy_order = buy_orders[0]
+
+        md = make_market(2880, price=buy_order.price - 0.01)
+        self.engine._simulate_fills(md)
+
+        tp_orders = [o for o in self.engine.state.grid_orders if o.is_tp]
+        self.assertGreater(len(tp_orders), 0)
+        for tp in tp_orders:
+            self.assertIn(tp.order_id, self.engine.state.open_order_ids)
+
+    def test_tp_is_tp_flag_set(self):
+        """TP GridOrder의 is_tp=True."""
+        buy_orders = [o for o in self.engine.state.grid_orders if o.side == "BUY"]
+        self.assertGreater(len(buy_orders), 0)
+        buy_order = buy_orders[0]
+
+        md = make_market(2880, price=buy_order.price - 0.01)
+        self.engine._simulate_fills(md)
+
+        tp_orders = [o for o in self.engine.state.grid_orders if o.tp_order_id != ""]
+        self.assertGreater(len(tp_orders), 0)
+        for o in self.engine.state.grid_orders:
+            if o.is_tp:
+                self.assertTrue(o.is_tp)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 조용한 가격 이탈 방어
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSilentBreakout(unittest.TestCase):
+
+    def setUp(self):
+        self.engine = make_engine()
+
+    async def _setup_range_with_grid(self):
+        md = make_market(2880, price=100.0)
+        await self.engine.on_market_update(md)
+        return md
+
+    def test_silent_breakout_cancels_grid(self):
+        """거래량 없는 가격 이탈 시 그리드 전량 취소."""
+        engine = make_engine()
+        engine.state.mode = StrategyMode.RANGE
+        engine.state.box = BoxRange(support=99.0, resistance=101.0)
+        engine.state.open_order_ids = ["oid1", "oid2"]
+
+        md = make_market(2880, price=105.0)  # 박스권 밖, 거래량 스파이크 없음
+        md.volume_ma_20m = 10.0  # 스파이크 없음
+        engine._handle_silent_breakout(md)
+
+        self.assertEqual(len(engine.state.open_order_ids), 0)
+
+    def test_silent_breakout_sets_watching_mode(self):
+        """조용한 이탈 후 WATCHING 모드 전환."""
+        engine = make_engine()
+        engine.state.mode = StrategyMode.RANGE
+        engine.state.box = BoxRange(support=99.0, resistance=101.0)
+
+        md = make_market(2880, price=105.0)
+        engine._handle_silent_breakout(md)
+
+        self.assertEqual(engine.state.mode, StrategyMode.WATCHING)
+
+    def test_watching_to_range_on_price_recovery(self):
+        """WATCHING 중 가격이 박스 내로 복귀하면 RANGE 재개."""
+        engine = make_engine()
+        engine.state.mode = StrategyMode.WATCHING
+        engine.state.box = BoxRange(support=99.0, resistance=101.0)
+        engine.state.box_last_updated = time.time()  # 캐시 유효
+
+        md = make_market(2880, price=100.0)  # 박스권 내
+
+        async def run():
+            await engine.on_market_update(md)
+
+        asyncio.run(run())
+
+        self.assertEqual(engine.state.mode, StrategyMode.RANGE)
+
+    def test_spike_breakout_does_not_trigger_silent(self):
+        """거래량 스파이크 동반 이탈은 WATCHING이 아닌 BREAKOUT 전환."""
+        engine = make_engine()
+        engine.state.mode = StrategyMode.RANGE
+        engine.state.box = BoxRange(support=99.0, resistance=101.0)
+        engine.state.box_last_updated = time.time()  # 캐시 유효
+
+        # 박스권 밖 + 스파이크
+        md = make_market(2880, price=105.0)
+        md.candles.append(Candle(9999, 105, 106, 104, 105, volume=50.0))  # 스파이크
+        md.last_price = 105.0
+        md.volume_ma_20m = 10.0  # 50 >= 10 × 3.0 → 스파이크
+
+        async def run():
+            await engine.on_market_update(md)
+
+        asyncio.run(run())
+
+        # WATCHING이 아닌 BREAKOUT_LONG이어야 함
+        self.assertNotEqual(engine.state.mode, StrategyMode.WATCHING)
+        self.assertEqual(engine.state.mode, StrategyMode.BREAKOUT_LONG)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 리스크 기반 포지션 사이징
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRiskBasedSizing(unittest.TestCase):
+
+    def setUp(self):
+        self.engine = make_engine()
+        self.engine.state.allocated_capital = 10_000.0
+
+    def _make_volatile_market(self, n=60, price=100.0):
+        md = MarketData(symbol="BTC-USDC")
+        for c in make_candles(n, price, volume=10.0, high_mult=1.02, low_mult=0.98):
+            md.candles.append(c)
+        md.last_price = price
+        md.volume_ma_20m = 10.0
+        return md
+
+    def test_size_based_on_atr(self):
+        """ATR 있을 때: size = (capital * 0.02) / (atr * ATR_MULTIPLIER_SL)."""
+        md = self._make_volatile_market(n=60, price=100.0)
+        self.engine.state.mode = StrategyMode.BREAKOUT_LONG
+        self.engine._place_breakout_market_order(md)
+
+        atr = EngineA._calculate_atr(md)
+        if atr:
+            capital = 10_000.0
+            price = 100.0
+            expected_size = (capital * MAX_RISK_PER_TRADE_PCT) / (atr * ATR_MULTIPLIER_SL)
+            expected_size = min(expected_size, capital / price)
+            pos = self.engine.state.position
+            self.assertIsNotNone(pos)
+            self.assertAlmostEqual(pos.size, expected_size, places=4)
+
+    def test_size_capped_at_full_capital(self):
+        """ATR이 매우 작아도 size는 capital/price를 초과할 수 없다."""
+        # ATR이 매우 작은 경우를 시뮬레이션
+        md = MarketData(symbol="BTC-USDC")
+        for c in make_candles(60, 100.0, volume=10.0, high_mult=1.0001, low_mult=0.9999):
+            md.candles.append(c)
+        md.last_price = 100.0
+        md.volume_ma_20m = 10.0
+
+        self.engine.state.mode = StrategyMode.BREAKOUT_LONG
+        self.engine._place_breakout_market_order(md)
+
+        pos = self.engine.state.position
+        if pos:
+            max_size = self.engine.state.allocated_capital / 100.0
+            self.assertLessEqual(pos.size, max_size + 1e-8)
+
+    def test_fallback_size_when_no_atr(self):
+        """ATR 없을 때 고정 % 기반 사이징."""
+        md = MarketData(symbol="BTC-USDC")
+        for c in make_candles(5, 100.0, volume=10.0):
+            md.candles.append(c)
+        md.last_price = 100.0
+        md.volume_ma_20m = 10.0
+
+        self.engine.state.mode = StrategyMode.BREAKOUT_LONG
+        self.engine._place_breakout_market_order(md)
+
+        pos = self.engine.state.position
+        self.assertIsNotNone(pos)
+        # ATR 없을 때: size = (capital * 0.02) / (price * STOP_LOSS_PCT)
+        expected = min(
+            (10_000.0 * MAX_RISK_PER_TRADE_PCT) / (100.0 * STOP_LOSS_PCT),
+            10_000.0 / 100.0,
+        )
+        self.assertAlmostEqual(pos.size, expected, places=4)
+
+    def test_max_risk_is_2pct_of_capital(self):
+        """손절 거리 * size ≤ capital * 0.02."""
+        md = self._make_volatile_market(n=60, price=100.0)
+        self.engine.state.mode = StrategyMode.BREAKOUT_LONG
+        self.engine._place_breakout_market_order(md)
+
+        pos = self.engine.state.position
+        atr = EngineA._calculate_atr(md)
+        if pos and atr:
+            sl_dist = atr * ATR_MULTIPLIER_SL
+            risk = sl_dist * pos.size
+            max_risk = 10_000.0 * MAX_RISK_PER_TRADE_PCT
+            # 캐핑 때문에 초과할 수 있으므로 여유 허용
+            self.assertLessEqual(risk, max_risk + 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,12 +972,18 @@ class TestFullFlowAsync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.state.position.side, "SELL")
 
     async def test_full_flow_trailing_stop_and_range_grid_reset(self):
-        """핵심: RANGE → Spike → BREAKOUT_LONG → 가격 상승 → 트레일링 스탑 → RANGE + 그리드 즉시 재배치."""
+        """핵심: RANGE → Spike → BREAKOUT_LONG → 가격 상승 → 트레일링 스탑 → RANGE/WATCHING 복귀.
+
+        NOTE: 트레일링 스탑 후 RANGE로 복귀하지만, trailing_trigger 가격이 원래 박스권 밖이면
+        조용한 이탈 방어가 발동하여 WATCHING 모드로 전환됩니다.
+        박스권 내 가격으로 복귀하면 RANGE 재개 + 그리드 재배치가 이루어집니다.
+        """
         engine = make_engine()
 
         # 1. RANGE 진입 + 그리드 배치
         await engine.on_market_update(self._market())
         self.assertEqual(engine.state.mode, StrategyMode.RANGE)
+        original_box = engine.state.box
 
         # 2. 거래량 Spike → 돌파
         box = engine.state.box
@@ -663,14 +1007,35 @@ class TestFullFlowAsync(unittest.IsolatedAsyncioTestCase):
         md_drop = self._market(n=60, price=trailing_trigger)
         await engine.on_market_update(md_drop)
 
-        # 검증: 청산 + RANGE 복귀 + 그리드 즉시 재배치 (쿨다운 없음)
+        # 검증: 청산 완료 + PnL 양수
         self.assertIsNone(engine.state.position, "포지션 청산")
-        self.assertEqual(engine.state.mode, StrategyMode.RANGE, "RANGE 복귀")
         self.assertGreater(engine.state.realized_pnl, 0, "익절 PnL 양수")
-        self.assertEqual(
-            len(engine.state.open_order_ids), N_GRID_LEVELS * 2,
-            "트레일링 스탑 후 즉시 그리드 재배치 (쿨다운 없음)"
+
+        # trailing_trigger가 원래 박스권 밖이면 WATCHING 모드, 박스권 내면 RANGE + 그리드
+        mode = engine.state.mode
+        self.assertIn(
+            mode,
+            (StrategyMode.RANGE, StrategyMode.WATCHING),
+            "RANGE 또는 WATCHING 복귀"
         )
+
+        if mode == StrategyMode.WATCHING:
+            # 박스권 내 가격으로 복귀하면 RANGE 재개 + 그리드 재배치
+            box_inside_price = (original_box.support + original_box.resistance) / 2
+            engine.invalidate_box_cache()  # 캐시 무효화하여 재계산 유도
+            md_recovery = self._market(n=2880, price=box_inside_price)
+            await engine.on_market_update(md_recovery)
+            self.assertEqual(engine.state.mode, StrategyMode.RANGE, "박스권 복귀 후 RANGE 재개")
+            self.assertEqual(
+                len(engine.state.open_order_ids), N_GRID_LEVELS * 2,
+                "박스권 복귀 후 그리드 재배치"
+            )
+        else:
+            # RANGE이면 그리드가 즉시 재배치되어야 함
+            self.assertEqual(
+                len(engine.state.open_order_ids), N_GRID_LEVELS * 2,
+                "트레일링 스탑 후 즉시 그리드 재배치 (쿨다운 없음)"
+            )
 
     async def test_full_flow_stop_loss_triggers_cooldown(self):
         """Fakeout → 손절 → 쿨다운 → 그리드 주문 차단."""

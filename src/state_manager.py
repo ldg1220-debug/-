@@ -112,6 +112,8 @@ class StateManager:
             "allocated_capital": state.allocated_capital,
             "realized_pnl": state.realized_pnl,
             "position": position_data,
+            "box_last_updated": state.box_last_updated,
+            "cooldown_until": getattr(state, "cooldown_until", 0.0),
         })
 
         with self._cursor() as cur:
@@ -150,6 +152,8 @@ class StateManager:
                 size=p["size"],
                 peak_price=p["peak_price"],
                 order_id=p.get("order_id", ""),
+                trailing_stop_distance=p.get("trailing_stop_distance", 0.0),
+                stop_loss_distance=p.get("stop_loss_distance", 0.0),
             )
 
         return EngineAState(
@@ -159,6 +163,8 @@ class StateManager:
             allocated_capital=data.get("allocated_capital", 0.0),
             realized_pnl=data.get("realized_pnl", 0.0),
             position=position,
+            box_last_updated=data.get("box_last_updated", 0.0),
+            cooldown_until=data.get("cooldown_until", 0.0),
         )
 
     # ------------------------------------------------------------------
