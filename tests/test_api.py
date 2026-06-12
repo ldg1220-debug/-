@@ -175,7 +175,7 @@ class TestEngineABoxCalculation(unittest.TestCase):
             highs=[100 + i for i in range(50)],
             lows=[90 + i for i in range(50)],
         )
-        box = engine.calculate_box(market)
+        box = engine.calculate_box_48h(market)
         self.assertEqual(box.support, 90.0)
         self.assertEqual(box.resistance, 149.0)
 
