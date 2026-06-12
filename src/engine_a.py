@@ -61,6 +61,12 @@ STOP_LOSS_PCT = 0.015
 # 리스크 기반 포지션 사이징
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.02"))
 
+# 추세 추종 (TREND_FOLLOWING) 전략
+TREND_EMA_SHORT = int(os.getenv("TREND_EMA_SHORT", "20"))
+TREND_EMA_LONG = int(os.getenv("TREND_EMA_LONG", "50"))
+ADX_TREND_THRESHOLD = float(os.getenv("ADX_TREND_THRESHOLD", "25.0"))
+TREND_ATR_MULTIPLIER = float(os.getenv("TREND_ATR_MULTIPLIER", "2.0"))  # Chandelier Exit 배수
+
 
 # ── 데이터 모델 ──────────────────────────────────────────────────────────────
 
@@ -69,6 +75,7 @@ class StrategyMode(Enum):
     BREAKOUT_LONG = auto()
     BREAKOUT_SHORT = auto()
     WATCHING = auto()
+    TREND_FOLLOWING = auto()   # EMA 정배열 + ADX 강세 구간 추세 추종
 
 
 @dataclass
@@ -219,6 +226,53 @@ class EngineA:
         )
         atr = float(df["tr"].rolling(window=ATR_PERIOD).mean().iloc[-1])
         return atr if atr > 0 else None
+
+    # ── 추세 지표 계산 ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _calculate_ema(market: MarketData, period: int) -> float | None:
+        """지수이동평균(EMA). pandas ewm 사용."""
+        candles = list(market.candles)
+        if len(candles) < period:
+            return None
+        closes = pd.Series([c.close for c in candles])
+        return float(closes.ewm(span=period, adjust=False).mean().iloc[-1])
+
+    @staticmethod
+    def _calculate_adx(market: MarketData, period: int = 14) -> float | None:
+        """Wilder 방식 ADX(평균방향성지수). 25 이상이면 강한 추세 장세."""
+        candles = list(market.candles)
+        if len(candles) < period * 2 + 1:
+            return None
+        df = pd.DataFrame([
+            {"high": c.high, "low": c.low, "close": c.close}
+            for c in candles[-(period * 3):]
+        ])
+        df["prev_close"] = df["close"].shift(1)
+        df["tr"] = (
+            df[["high", "prev_close"]].max(axis=1)
+            - df[["low", "prev_close"]].min(axis=1)
+        )
+        df["dm_plus"] = df["high"] - df["high"].shift(1)
+        df["dm_minus"] = df["low"].shift(1) - df["low"]
+        df["dm_plus"] = df["dm_plus"].where(
+            (df["dm_plus"] > df["dm_minus"]) & (df["dm_plus"] > 0), 0.0
+        )
+        df["dm_minus"] = df["dm_minus"].where(
+            (df["dm_minus"] > df["dm_plus"]) & (df["dm_minus"] > 0), 0.0
+        )
+        alpha = 1.0 / period
+        atr14 = df["tr"].ewm(alpha=alpha, adjust=False).mean()
+        dmp14 = df["dm_plus"].ewm(alpha=alpha, adjust=False).mean()
+        dmm14 = df["dm_minus"].ewm(alpha=alpha, adjust=False).mean()
+
+        safe_atr = atr14.replace(0, float("nan"))
+        di_plus = 100.0 * dmp14 / safe_atr
+        di_minus = 100.0 * dmm14 / safe_atr
+        di_sum = (di_plus + di_minus).replace(0, float("nan"))
+        dx = 100.0 * (di_plus - di_minus).abs() / di_sum
+        adx = float(dx.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+        return adx if pd.notna(adx) and adx > 0 else None
 
     # ── 단계 1: 48시간 박스권 + 그리드 주문 ──────────────────────────────────
 
@@ -631,6 +685,34 @@ class EngineA:
         price = market.last_price
         pos.update_peak(price)
 
+        # ── TREND_FOLLOWING 모드 전용 청산 ───────────────────────────────────
+        if self.state.mode == StrategyMode.TREND_FOLLOWING:
+            # 데드크로스: EMA 역배열 시 즉시 강제 청산
+            if self._is_dead_cross(market):
+                logger.warning(
+                    "⚠️  [데드크로스] EMA%d < EMA%d → 추세 반전 강제 청산",
+                    TREND_EMA_SHORT, TREND_EMA_LONG,
+                )
+                self._close_position(market, "DEAD_CROSS")
+                return
+            # 샹들리에 익절: 최고가 - 2×ATR 라인 하향 돌파
+            if pos.should_trailing_stop(price):
+                chandelier_line = pos.peak_price - pos.trailing_stop_distance
+                logger.info(
+                    "🎯 [샹들리에] peak=%.2f line=%.2f current=%.2f → 트레일링 익절",
+                    pos.peak_price, chandelier_line, price,
+                )
+                self._close_position(market, "CHANDELIER")
+            # 초기 손절 (추세 시작 직후 역행)
+            elif pos.should_stop_loss(price):
+                logger.warning(
+                    "🛑 [추세 손절] entry=%.2f current=%.2f SL=%.4f",
+                    pos.entry_price, price, pos.stop_loss_distance,
+                )
+                self._close_position(market, "STOP_LOSS")
+            return
+
+        # ── BREAKOUT 모드 청산 ────────────────────────────────────────────────
         if pos.should_stop_loss(price):
             logger.warning(
                 "🛑 [손절] entry=%.2f current=%.2f  효과 스탑=%.2f%%",
@@ -677,6 +759,80 @@ class EngineA:
         self.state.open_order_ids.clear()
         logger.info("🔄 RANGE 복귀%s", " (쿨다운 중)" if self._is_in_cooldown() else "")
 
+    # ── 추세 추종 전략 (TREND_FOLLOWING) ─────────────────────────────────────
+
+    def _is_dead_cross(self, market: MarketData) -> bool:
+        """EMA 단기선이 장기선 아래로 데드크로스하면 True (추세 반전 신호)."""
+        ema_s = self._calculate_ema(market, TREND_EMA_SHORT)
+        ema_l = self._calculate_ema(market, TREND_EMA_LONG)
+        if ema_s is None or ema_l is None:
+            return False
+        return ema_s < ema_l
+
+    def _is_trend_entry_signal(self, market: MarketData) -> bool:
+        """추세 추종 진입 조건.
+
+        세 가지 동시 충족 시 True:
+          1. ADX > ADX_TREND_THRESHOLD (강한 추세 장세)
+          2. EMA_SHORT > EMA_LONG (정배열 / 골든크로스 유지)
+          3. price >= EMA_SHORT (눌림목 후 단기선 지지 확인)
+        """
+        if self.state.position is not None or self._is_in_cooldown():
+            return False
+        ema_s = self._calculate_ema(market, TREND_EMA_SHORT)
+        ema_l = self._calculate_ema(market, TREND_EMA_LONG)
+        adx = self._calculate_adx(market)
+        if any(v is None for v in [ema_s, ema_l, adx]):
+            return False
+        price = market.last_price
+        if adx > ADX_TREND_THRESHOLD and ema_s > ema_l and price >= ema_s:
+            logger.info(
+                "📈 추세 진입 신호: ADX=%.1f EMA%d=%.2f EMA%d=%.2f price=%.2f",
+                adx, TREND_EMA_SHORT, ema_s, TREND_EMA_LONG, ema_l, price,
+            )
+            return True
+        return False
+
+    def _enter_trend_following(self, market: MarketData) -> None:
+        """추세 추종 롱 포지션 진입.
+
+        - 리스크 기반 사이징: (자본 × 2%) / (ATR × 2.0)
+        - 샹들리에 스탑 거리: ATR × TREND_ATR_MULTIPLIER
+        - BreakoutPosition 재사용 (trailing_stop_distance = Chandelier 거리)
+        """
+        price = market.last_price
+        capital = self.state.allocated_capital
+        if capital <= 0 or price <= 0:
+            return
+        atr = self._calculate_atr(market)
+        if atr is None:
+            logger.warning("ATR 없음 — 추세 추종 진입 불가")
+            return
+
+        sl_dist = round(atr * TREND_ATR_MULTIPLIER, 4)
+        max_risk_usdc = capital * MAX_RISK_PER_TRADE_PCT
+        size = max_risk_usdc / sl_dist
+        size = min(size, capital / price)  # 자본 초과 방지
+
+        payload = self._build_market_payload("BUY", size, price)
+        order_id = self._send_order(payload)
+        if order_id:
+            self.state.mode = StrategyMode.TREND_FOLLOWING
+            # Chandelier: trailing_stop_distance = 2×ATR (peak 기준으로 추적)
+            self.state.position = BreakoutPosition(
+                side="BUY",
+                entry_price=price,
+                size=size,
+                peak_price=price,
+                order_id=order_id,
+                trailing_stop_distance=sl_dist,
+                stop_loss_distance=sl_dist,
+            )
+            logger.info(
+                "📈 [TREND] 진입: BUY %.6f @ %.2f | Chandelier=%.4f(%.2f%%) | 리스크=%.2f USDC",
+                size, price, sl_dist, sl_dist / price * 100, max_risk_usdc,
+            )
+
     # ── 단계 5: 메인 비동기 Tick ──────────────────────────────────────────────
 
     async def on_market_update(self, market: MarketData) -> None:
@@ -705,9 +861,14 @@ class EngineA:
                     return
 
             if mode == StrategyMode.RANGE and spike:
+                # 우선순위 1: 거래량 스파이크 돌파
                 direction = self._determine_breakout_direction(market)
                 self._execute_emergency_switch(direction, market)
+            elif mode == StrategyMode.RANGE and self._is_trend_entry_signal(market):
+                # 우선순위 2: 추세 추종 진입 (ADX + EMA 정배열 + 눌림목)
+                self._enter_trend_following(market)
             elif mode == StrategyMode.RANGE and not self.state.open_order_ids:
+                # 우선순위 3: 박스권 그리드 주문
                 self.place_range_orders(market)
 
     # ── edgeX API 경계 (mock / 실제 교체 포인트) ─────────────────────────────
@@ -779,6 +940,8 @@ class EngineA:
                 "size": pos.size,
                 "trailing_dist": pos.trailing_stop_distance,
                 "sl_dist": pos.stop_loss_distance,
+                "chandelier_line": (pos.peak_price - pos.trailing_stop_distance)
+                if self.state.mode == StrategyMode.TREND_FOLLOWING else None,
             } if pos else None,
             "realized_pnl": self.state.realized_pnl,
         }

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src.data_fetcher import Candle, MarketData
 from src.engine_a import (
+    ADX_TREND_THRESHOLD,
     ATR_MULTIPLIER_SL,
     ATR_MULTIPLIER_TRAILING,
     ATR_PERIOD,
@@ -34,6 +35,9 @@ from src.engine_a import (
     STOP_LOSS_COOLDOWN_SECONDS,
     STOP_LOSS_PCT,
     TRAILING_STOP_PCT,
+    TREND_ATR_MULTIPLIER,
+    TREND_EMA_LONG,
+    TREND_EMA_SHORT,
     BoxRange,
     BreakoutPosition,
     EngineA,
@@ -1082,6 +1086,378 @@ class TestFullFlowAsync(unittest.IsolatedAsyncioTestCase):
             engine.state.mode,
             (StrategyMode.BREAKOUT_LONG, StrategyMode.BREAKOUT_SHORT, StrategyMode.RANGE),
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 추세 추종 — 지표 계산
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTrendIndicators(unittest.TestCase):
+    """EMA·ADX 계산 함수 단위 테스트."""
+
+    def _make_trending_market(self, n: int = 200, slope: float = 0.5) -> MarketData:
+        """꾸준히 상승하는 캔들 시퀀스 (EMA20 > EMA50 유도)."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(n):
+            p = 100.0 + slope * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = 100.0 + slope * (n - 1)
+        md.volume_ma_20m = 10.0
+        return md
+
+    def _make_flat_market(self, n: int = 200) -> MarketData:
+        """완전히 수평인 캔들 (ADX ≈ 0)."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(n):
+            md.candles.append(Candle(i * 60_000, 100.0, 100.5, 99.5, 100.0, 10.0))
+        md.last_price = 100.0
+        md.volume_ma_20m = 10.0
+        return md
+
+    def test_ema_short_returns_float(self):
+        md = self._make_trending_market(100)
+        result = EngineA._calculate_ema(md, TREND_EMA_SHORT)
+        self.assertIsInstance(result, float)
+        self.assertGreater(result, 0)
+
+    def test_ema_long_returns_float(self):
+        md = self._make_trending_market(200)
+        result = EngineA._calculate_ema(md, TREND_EMA_LONG)
+        self.assertIsInstance(result, float)
+
+    def test_ema_insufficient_data_returns_none(self):
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(5):
+            md.candles.append(Candle(i, 100, 101, 99, 100, 1.0))
+        self.assertIsNone(EngineA._calculate_ema(md, TREND_EMA_SHORT))
+
+    def test_ema_short_above_long_in_uptrend(self):
+        """상승 추세에서 EMA20 > EMA50 (정배열)."""
+        md = self._make_trending_market(200, slope=1.0)
+        ema_s = EngineA._calculate_ema(md, TREND_EMA_SHORT)
+        ema_l = EngineA._calculate_ema(md, TREND_EMA_LONG)
+        self.assertGreater(ema_s, ema_l)
+
+    def test_ema_short_below_long_in_downtrend(self):
+        """하락 추세에서 EMA20 < EMA50 (역배열)."""
+        md = self._make_trending_market(200, slope=-1.0)
+        ema_s = EngineA._calculate_ema(md, TREND_EMA_SHORT)
+        ema_l = EngineA._calculate_ema(md, TREND_EMA_LONG)
+        self.assertLess(ema_s, ema_l)
+
+    def test_adx_returns_float_for_trending_market(self):
+        md = self._make_trending_market(200, slope=0.5)
+        result = EngineA._calculate_adx(md)
+        self.assertIsInstance(result, float)
+        self.assertGreater(result, 0)
+
+    def test_adx_returns_none_insufficient_data(self):
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(10):
+            md.candles.append(Candle(i, 100, 101, 99, 100, 1.0))
+        self.assertIsNone(EngineA._calculate_adx(md))
+
+    def test_adx_low_in_flat_market(self):
+        """횡보장에서 ADX는 낮아야 합니다 (25 미만)."""
+        md = self._make_flat_market(200)
+        adx = EngineA._calculate_adx(md)
+        if adx is not None:
+            self.assertLess(adx, ADX_TREND_THRESHOLD)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 추세 추종 — 진입 신호
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTrendEntrySignal(unittest.TestCase):
+    """_is_trend_entry_signal 조건 검증."""
+
+    def _make_strong_trend_market(self) -> MarketData:
+        """ADX > 25, EMA20 > EMA50, price ≈ EMA20 (눌림목)을 만족하는 시장."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 100.0 + 0.8 * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        # last_price를 EMA20 근처로 설정 (눌림목)
+        md.last_price = 100.0 + 0.8 * 180  # 최근 EMA20 근처
+        md.volume_ma_20m = 10.0
+        return md
+
+    def setUp(self):
+        self.engine = make_engine()
+
+    def test_signal_blocked_when_position_exists(self):
+        """이미 포지션이 있으면 추세 진입 신호 무시."""
+        self.engine.state.position = BreakoutPosition(
+            side="BUY", entry_price=100.0, size=1.0, peak_price=100.0
+        )
+        md = self._make_strong_trend_market()
+        self.assertFalse(self.engine._is_trend_entry_signal(md))
+
+    def test_signal_blocked_during_cooldown(self):
+        """쿨다운 중에는 추세 진입 불가."""
+        self.engine.state.cooldown_until = time.time() + 9999
+        md = self._make_strong_trend_market()
+        self.assertFalse(self.engine._is_trend_entry_signal(md))
+
+    def test_no_signal_insufficient_data(self):
+        """캔들 부족 시 지표 계산 불가 → 진입 신호 없음."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(10):
+            md.candles.append(Candle(i, 100, 101, 99, 100, 1.0))
+        md.last_price = 100.0
+        self.assertFalse(self.engine._is_trend_entry_signal(md))
+
+    def test_no_signal_price_below_ema20(self):
+        """현재가가 EMA20 아래이면 눌림목 진입 조건 미충족."""
+        md = self._make_strong_trend_market()
+        md.last_price = 10.0   # EMA20보다 훨씬 아래
+        self.assertFalse(self.engine._is_trend_entry_signal(md))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 추세 추종 — 샹들리에 청산 + 데드크로스
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChandelierExit(unittest.TestCase):
+    """샹들리에 익절(Chandelier Exit) 동작 검증."""
+
+    def setUp(self):
+        self.engine = make_engine()
+        self.engine.state.mode = StrategyMode.TREND_FOLLOWING
+        # 추세 포지션 세팅: 진입 100, 최고가 120, Chandelier 거리 5.0
+        self.engine.state.position = BreakoutPosition(
+            side="BUY",
+            entry_price=100.0,
+            size=0.5,
+            peak_price=120.0,
+            trailing_stop_distance=5.0,  # Chandelier line = 120 - 5 = 115
+            stop_loss_distance=5.0,
+        )
+
+    def _make_md(self, price: float) -> MarketData:
+        # EMA20 > EMA50 상태 유지 (데드크로스 발생 방지)
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 100.0 + 0.5 * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = price
+        md.volume_ma_20m = 10.0
+        return md
+
+    def test_chandelier_not_triggered_above_line(self):
+        """현재가 > 샹들리에 라인(115) → 포지션 유지."""
+        md = self._make_md(116.0)
+        self.engine._check_exit_conditions(md)
+        self.assertIsNotNone(self.engine.state.position)
+        self.assertEqual(self.engine.state.mode, StrategyMode.TREND_FOLLOWING)
+
+    def test_chandelier_triggers_below_line(self):
+        """현재가 ≤ 샹들리에 라인(115) → 전량 익절 청산."""
+        md = self._make_md(114.9)
+        self.engine._check_exit_conditions(md)
+        self.assertIsNone(self.engine.state.position)
+        self.assertEqual(self.engine.state.mode, StrategyMode.RANGE)
+
+    def test_peak_updated_during_trend(self):
+        """추세 중 최고가 갱신 → 샹들리에 라인도 올라감."""
+        pos = self.engine.state.position
+        pos.update_peak(130.0)
+        self.assertEqual(pos.peak_price, 130.0)
+        # 새 Chandelier line = 130 - 5 = 125
+        md = self._make_md(126.0)
+        self.engine._check_exit_conditions(md)
+        self.assertIsNotNone(self.engine.state.position, "125 위 → 포지션 유지")
+
+    def test_chandelier_exit_returns_to_range(self):
+        """샹들리에 청산 후 RANGE 모드 복귀."""
+        md = self._make_md(110.0)   # 115 아래
+        self.engine._check_exit_conditions(md)
+        self.assertEqual(self.engine.state.mode, StrategyMode.RANGE)
+        self.assertIsNone(self.engine.state.position)
+
+    def test_chandelier_no_cooldown(self):
+        """샹들리에 익절은 쿨다운을 유발하지 않습니다."""
+        md = self._make_md(110.0)
+        self.engine._check_exit_conditions(md)
+        self.assertAlmostEqual(self.engine.state.cooldown_until, 0.0, delta=1.0)
+
+
+class TestDeadCrossExit(unittest.TestCase):
+    """데드크로스 강제 청산 동작 검증."""
+
+    def setUp(self):
+        self.engine = make_engine()
+        self.engine.state.mode = StrategyMode.TREND_FOLLOWING
+        self.engine.state.position = BreakoutPosition(
+            side="BUY", entry_price=100.0, size=0.5,
+            peak_price=110.0, trailing_stop_distance=10.0, stop_loss_distance=10.0,
+        )
+
+    def _make_dead_cross_market(self) -> MarketData:
+        """EMA20 < EMA50 (하락 추세, 데드크로스) 시장."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 200.0 - 0.8 * i    # 지속 하락
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = 200.0 - 0.8 * 199
+        md.volume_ma_20m = 10.0
+        return md
+
+    def _make_golden_cross_market(self) -> MarketData:
+        """EMA20 > EMA50 (상승 추세, 골든크로스) 시장."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 100.0 + 0.8 * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = 100.0 + 0.8 * 199
+        md.volume_ma_20m = 10.0
+        return md
+
+    def test_dead_cross_forces_exit(self):
+        """데드크로스 발생 시 포지션 강제 청산."""
+        md = self._make_dead_cross_market()
+        self.engine._check_exit_conditions(md)
+        self.assertIsNone(self.engine.state.position)
+        self.assertEqual(self.engine.state.mode, StrategyMode.RANGE)
+
+    def test_no_exit_on_golden_cross(self):
+        """골든크로스(정배열) 상태에서는 데드크로스 청산 없음."""
+        md = self._make_golden_cross_market()
+        last_price = md.last_price
+        # Chandelier 라인이 현재가 아래 (last_price - 5) 가 되도록 세팅
+        pos = self.engine.state.position
+        pos.peak_price = last_price          # 최고가 = 현재가
+        pos.trailing_stop_distance = 50.0   # Chandelier line = last_price - 50 (훨씬 아래)
+        pos.stop_loss_distance = 50.0
+        pos.entry_price = last_price - 100.0  # 진입가도 Chandelier 아래로
+        self.engine._check_exit_conditions(md)
+        self.assertIsNotNone(self.engine.state.position)
+
+    def test_dead_cross_no_cooldown(self):
+        """데드크로스 청산도 쿨다운 없음 (손절 아님)."""
+        md = self._make_dead_cross_market()
+        self.engine._check_exit_conditions(md)
+        self.assertAlmostEqual(self.engine.state.cooldown_until, 0.0, delta=1.0)
+
+    def test_is_dead_cross_returns_true_in_downtrend(self):
+        """_is_dead_cross: 하락 추세에서 True."""
+        md = self._make_dead_cross_market()
+        self.assertTrue(self.engine._is_dead_cross(md))
+
+    def test_is_dead_cross_returns_false_in_uptrend(self):
+        """_is_dead_cross: 상승 추세에서 False."""
+        md = self._make_golden_cross_market()
+        self.assertFalse(self.engine._is_dead_cross(md))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 추세 추종 — 통합 상태 머신
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTrendStateMachine(unittest.IsolatedAsyncioTestCase):
+    """RANGE → TREND_FOLLOWING → RANGE 전체 흐름 검증."""
+
+    def _make_trending_md(self, price: float = 200.0) -> MarketData:
+        """상승 추세 + price가 EMA20 근처 (ADX > 25 유도)."""
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 100.0 + 0.8 * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = price
+        md.volume_ma_20m = 10.0
+        return md
+
+    def _make_dead_cross_md(self) -> MarketData:
+        md = MarketData(symbol="BTC-USDC")
+        for i in range(200):
+            p = 300.0 - 1.0 * i
+            md.candles.append(Candle(i * 60_000, p, p * 1.005, p * 0.995, p, 10.0))
+        md.last_price = 300.0 - 199
+        md.volume_ma_20m = 10.0
+        return md
+
+    async def test_trend_entry_sets_mode(self):
+        """추세 진입 시 TREND_FOLLOWING 모드 전환 + 포지션 생성."""
+        engine = make_engine()
+        md = self._make_trending_md()
+        # 강제로 trend entry signal 발생시키기
+        with patch.object(engine, "_is_trend_entry_signal", return_value=True):
+            await engine.on_market_update(md)
+        self.assertEqual(engine.state.mode, StrategyMode.TREND_FOLLOWING)
+        self.assertIsNotNone(engine.state.position)
+
+    async def test_breakout_takes_priority_over_trend(self):
+        """거래량 스파이크 돌파가 추세 진입보다 우선합니다."""
+        engine = make_engine()
+        md = make_market(2880, price=100.0, volume=35.0, volume_ma_20m=10.0)
+        with patch.object(engine, "_is_trend_entry_signal", return_value=True):
+            await engine.on_market_update(md)
+        # 스파이크로 인해 BREAKOUT 모드여야 함
+        self.assertIn(
+            engine.state.mode,
+            (StrategyMode.BREAKOUT_LONG, StrategyMode.BREAKOUT_SHORT),
+        )
+
+    async def test_dead_cross_exits_trend_to_range(self):
+        """데드크로스 발생 시 TREND → RANGE 복귀."""
+        engine = make_engine()
+        engine.state.mode = StrategyMode.TREND_FOLLOWING
+        engine.state.position = BreakoutPosition(
+            side="BUY", entry_price=100.0, size=0.5,
+            peak_price=120.0, trailing_stop_distance=50.0, stop_loss_distance=50.0,
+        )
+        md = self._make_dead_cross_md()
+        await engine.on_market_update(md)
+        self.assertEqual(engine.state.mode, StrategyMode.RANGE)
+        self.assertIsNone(engine.state.position)
+
+    async def test_trend_size_uses_risk_model(self):
+        """추세 포지션 사이징: (자본×2%) / (ATR×2.0)."""
+        engine = make_engine()
+        md = self._make_trending_md()
+        with patch.object(engine, "_is_trend_entry_signal", return_value=True):
+            await engine.on_market_update(md)
+        if engine.state.position:
+            pos = engine.state.position
+            # 손절 거리 × size ≤ 자본의 2%
+            max_loss = engine.state.allocated_capital * MAX_RISK_PER_TRADE_PCT
+            actual_loss = pos.stop_loss_distance * pos.size
+            self.assertLessEqual(actual_loss, max_loss * 1.01)  # 1% 허용 오차
+
+    async def test_chandelier_distance_equals_two_atr(self):
+        """Chandelier 거리가 ATR × TREND_ATR_MULTIPLIER 와 일치."""
+        engine = make_engine()
+        md = self._make_trending_md()
+        with patch.object(engine, "_is_trend_entry_signal", return_value=True):
+            await engine.on_market_update(md)
+        if engine.state.position:
+            pos = engine.state.position
+            atr = EngineA._calculate_atr(md)
+            if atr:
+                expected = round(atr * TREND_ATR_MULTIPLIER, 4)
+                self.assertAlmostEqual(pos.trailing_stop_distance, expected, places=3)
+
+    async def test_range_to_trend_to_range_full_cycle(self):
+        """RANGE → TREND_FOLLOWING → (Chandelier) → RANGE 전체 사이클."""
+        engine = make_engine()
+
+        # Step1: 추세 진입
+        md_trend = self._make_trending_md()
+        with patch.object(engine, "_is_trend_entry_signal", return_value=True):
+            await engine.on_market_update(md_trend)
+        self.assertEqual(engine.state.mode, StrategyMode.TREND_FOLLOWING)
+
+        # Step2: 가격 급락으로 Chandelier 청산 (EMA 정배열 유지)
+        if engine.state.position:
+            pos = engine.state.position
+            pos.peak_price = 250.0
+            pos.trailing_stop_distance = 5.0
+            pos.stop_loss_distance = 5.0
+        md_fall = self._make_trending_md(price=100.0)  # EMA20 > EMA50 유지, 가격만 낮춤
+        md_fall.last_price = 200.0  # Chandelier line = 250-5=245 → 200 < 245 → 청산
+        await engine.on_market_update(md_fall)
+        self.assertEqual(engine.state.mode, StrategyMode.RANGE)
 
 
 if __name__ == "__main__":
