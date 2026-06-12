@@ -8,7 +8,10 @@ tests/test_optimizer.py
 - 표류 감지(Drift detection): 통계적으로 다른 시장 감지
 - Optimizer.run_cycle(): 세대 진행에 따른 fitness 개선 검증
 - Optimizer.apply_to_env(): .env 파일 쓰기/갱신
+- Optimizer.apply_to_config(): config/strategy_config.json 쓰기/갱신
+- Optimizer.load_from_config(): JSON 파라미터 복원
 - Optimizer.should_retrain(): 일정/표류 기반 재학습 트리거
+- 통합: 드리프트 캔들 → Drift 감지 → GA → fitness 수렴 전체 파이프라인
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from src.optimizer import (
     tournament_select,
     uniform_crossover,
 )
+import json
 
 try:
     from src.backtest import Candle
@@ -631,6 +635,275 @@ class TestIntegration(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# strategy_config.json 읽기/쓰기 테스트
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConfigJson(unittest.TestCase):
+
+    def _temp_config_dir(self):
+        d = tempfile.mkdtemp()
+        return d, os.path.join(d, "strategy_config.json")
+
+    def test_apply_to_config_creates_file(self):
+        """apply_to_config()가 JSON 파일을 생성해야 한다."""
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(Genome(), config_path=path)
+            self.assertTrue(os.path.exists(path))
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_apply_to_config_valid_json(self):
+        """생성된 파일은 유효한 JSON이어야 한다."""
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(Genome(), config_path=path)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertIn("parameters", data)
+            self.assertIn("ga_metadata", data)
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_config_contains_all_genes(self):
+        """config.json의 parameters 섹션에 모든 유전자 키가 있어야 한다."""
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(Genome(), config_path=path)
+            with open(path) as f:
+                params = json.load(f)["parameters"]
+            for name in GENE_BOUNDS:
+                self.assertIn(name, params, f"{name} missing in config")
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_config_values_match_genome(self):
+        """config에 기록된 수치가 Genome 값과 정확히 일치해야 한다."""
+        g = Genome(box_lookback=88, volume_spike_multiplier=2.7, trailing_stop_pct=0.025)
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(g, config_path=path)
+            with open(path) as f:
+                params = json.load(f)["parameters"]
+            self.assertEqual(params["box_lookback"], 88)
+            self.assertAlmostEqual(params["volume_spike_multiplier"], 2.7, places=4)
+            self.assertAlmostEqual(params["trailing_stop_pct"], 0.025, places=5)
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_config_metadata_has_fitness_and_timestamp(self):
+        """ga_metadata에 fitness와 updated_at 필드가 있어야 한다."""
+        g = Genome(); g.fitness = 3.14
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(g, config_path=path)
+            with open(path) as f:
+                meta = json.load(f)["ga_metadata"]
+            self.assertAlmostEqual(meta["fitness"], 3.14, places=4)
+            self.assertIn("updated_at", meta)
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_config_preserves_extra_keys(self):
+        """기존 JSON에 있던 다른 키는 덮어쓰지 않아야 한다."""
+        d, path = self._temp_config_dir()
+        try:
+            with open(path, "w") as f:
+                json.dump({"custom_key": "custom_value"}, f)
+            Optimizer().apply_to_config(Genome(), config_path=path)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(data.get("custom_key"), "custom_value")
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_load_from_config_returns_genome(self):
+        """저장 후 load_from_config()로 Genome을 복원할 수 있어야 한다."""
+        g = Genome(box_lookback=77, trailing_stop_pct=0.03)
+        g.fitness = 1.5
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(g, config_path=path)
+            restored = Optimizer.load_from_config(config_path=path)
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.box_lookback, 77)
+            self.assertAlmostEqual(restored.trailing_stop_pct, 0.03, places=5)
+            self.assertAlmostEqual(restored.fitness, 1.5, places=3)
+        finally:
+            import shutil; shutil.rmtree(d)
+
+    def test_load_from_config_returns_none_when_missing(self):
+        """파일이 없으면 None을 반환해야 한다."""
+        self.assertIsNone(Optimizer.load_from_config("/nonexistent/path.json"))
+
+    def test_load_from_config_returns_none_on_corrupt_json(self):
+        """JSON이 손상된 경우 None을 반환해야 한다."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("{invalid json{{")
+            path = f.name
+        try:
+            self.assertIsNone(Optimizer.load_from_config(config_path=path))
+        finally:
+            os.unlink(path)
+
+    def test_roundtrip_preserves_all_genes(self):
+        """저장 → 복원 후 모든 유전자 값이 동일해야 한다 (정수 포함)."""
+        rng = random.Random(42)
+        original = Genome.random(rng)
+        d, path = self._temp_config_dir()
+        try:
+            Optimizer().apply_to_config(original, config_path=path)
+            restored = Optimizer.load_from_config(config_path=path)
+            for name, (_, _, is_int) in GENE_BOUNDS.items():
+                ov = getattr(original, name)
+                rv = getattr(restored, name)
+                if is_int:
+                    self.assertEqual(ov, rv, f"{name}: {ov} ≠ {rv}")
+                else:
+                    self.assertAlmostEqual(ov, rv, places=4, msg=f"{name}: {ov} ≠ {rv}")
+        finally:
+            import shutil; shutil.rmtree(d)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 전체 진화 파이프라인: Drift 감지 → GA 수렴 검증
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFullEvolutionPipeline(unittest.TestCase):
+    """
+    명세서의 핵심 검증 시나리오:
+    (A) 인위적으로 거래량·변동성을 3배 이상 증폭한 데이터 → should_retrain() Drift 감지
+    (B) run_cycle() 실행 → 세대를 거듭할수록 best_fitness가 단조 증가
+    (C) 최종 최적 파라미터가 .env와 config.json에 영구 기록됨
+    """
+
+    def _stable_candles(self, n=500):
+        """안정적인 베이스라인 캔들 (낮은 거래량/변동성)."""
+        return make_candles(n, price=100.0, volume=10.0, vol_noise=1.0)
+
+    def _volatile_candles(self, n=300):
+        """거래량 3배 + 변동성 급등 시뮬레이션 (Drift 유발)."""
+        return make_candles(n, price=100.0, volume=35.0, vol_noise=5.0)
+
+    def test_A_drift_detected_on_3x_volume(self):
+        """거래량 3배 이상 급등 데이터에서 Drift가 정확히 감지되어야 한다."""
+        stable = self._stable_candles()
+        volatile = self._volatile_candles()
+
+        opt = Optimizer(fitness_fn=mock_fitness_fn)
+        should, reason = opt.should_retrain(
+            recent_candles=volatile,
+            baseline_candles=stable,
+            last_retrain_ts=time.time() - 1 * 86_400,  # 1일 전 (7일 미도달)
+            retrain_interval_days=7.0,
+        )
+        self.assertTrue(should, f"3배 거래량인데 Drift 미감지: {reason}")
+        self.assertIn("drift", reason)
+
+    def test_B_fitness_converges_over_generations(self):
+        """GA 세대가 진행될수록 best_fitness가 단조 증가(≥ 이전 세대)해야 한다."""
+        candles = make_candles(400, price=100.0, volume=10.0, vol_noise=3.0)
+        opt = Optimizer(
+            population_size=8,
+            generations=6,
+            elitism=2,
+            mutation_rate=0.2,
+            seed=99,
+            fitness_fn=mock_fitness_fn,
+        )
+        opt.run_cycle(candles)
+        bests = [e["best_fitness"] for e in opt.generation_log]
+
+        # 단조 비감소: 엘리트 보존으로 보장됨
+        for i in range(1, len(bests)):
+            self.assertGreaterEqual(
+                bests[i], bests[i - 1] - 1e-9,
+                f"Gen {i} fitness {bests[i]:.4f} < Gen {i-1} {bests[i-1]:.4f}",
+            )
+
+        # 마지막 세대 fitness가 초기 세대보다 높아야 함 (수렴 검증)
+        self.assertGreater(bests[-1], bests[0], "마지막 세대가 첫 세대보다 높아야 함")
+
+    def test_C_full_pipeline_env_and_config(self):
+        """Drift 감지 → GA → .env + config.json 파일 기록 전체 파이프라인."""
+        candles = make_candles(300, price=100.0, volume=10.0, vol_noise=3.0)
+        opt = Optimizer(
+            population_size=4,
+            generations=3,
+            seed=7,
+            fitness_fn=mock_fitness_fn,
+        )
+
+        env_path = tempfile.mktemp(suffix=".env")
+        config_dir = tempfile.mkdtemp()
+        config_path = os.path.join(config_dir, "strategy_config.json")
+
+        try:
+            # GA 실행
+            best = opt.run_cycle(candles)
+
+            # 영구 기록
+            opt.apply_to_env(best, env_path=env_path)
+            opt.apply_to_config(best, config_path=config_path)
+
+            # .env 검증
+            self.assertTrue(os.path.exists(env_path))
+            with open(env_path) as f:
+                env_content = f.read()
+            self.assertIn("BOX_LOOKBACK", env_content)
+            self.assertIn("VOLUME_SPIKE_MULTIPLIER", env_content)
+
+            # config.json 검증
+            self.assertTrue(os.path.exists(config_path))
+            with open(config_path) as f:
+                config = json.load(f)
+            self.assertIn("parameters", config)
+            self.assertIn("ga_metadata", config)
+            self.assertAlmostEqual(
+                config["ga_metadata"]["fitness"], best.fitness, places=3
+            )
+
+            # 복원 검증
+            restored = Optimizer.load_from_config(config_path=config_path)
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.box_lookback, best.box_lookback)
+
+        finally:
+            if os.path.exists(env_path):
+                os.unlink(env_path)
+            import shutil; shutil.rmtree(config_dir)
+
+    def test_D_stable_market_no_early_retrain(self):
+        """안정 시장이고 7일 미경과 시 재학습 트리거가 켜지지 않아야 한다."""
+        stable = self._stable_candles()
+        opt = Optimizer(fitness_fn=mock_fitness_fn)
+        recent_ts = time.time() - 1 * 86_400  # 1일 전
+        should, reason = opt.should_retrain(
+            recent_candles=stable,
+            baseline_candles=stable,
+            last_retrain_ts=recent_ts,
+            retrain_interval_days=7.0,
+        )
+        self.assertFalse(should, f"안정 시장인데 재학습 트리거: {reason}")
+        self.assertIn("stable", reason)
+
+    def test_E_generation_log_fitness_range(self):
+        """mock_fitness_fn 기준 최종 best_fitness가 0.5 이상 수렴해야 한다."""
+        candles = make_candles(200, price=100.0, volume=8.0)
+        opt = Optimizer(
+            population_size=10,
+            generations=8,
+            elitism=2,
+            seed=1,
+            fitness_fn=mock_fitness_fn,
+        )
+        best = opt.run_cycle(candles)
+        # mock_fitness = box_lookback/200 → 범위 [0.1, 1.0]
+        self.assertGreaterEqual(best.fitness, 0.5,
+            f"8세대 수렴 후 fitness={best.fitness:.3f} < 0.5")
 
 
 if __name__ == "__main__":

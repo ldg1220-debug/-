@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import os
@@ -416,3 +417,80 @@ class Optimizer:
             return True, f"scheduled (every {retrain_interval_days:.0f}d, last={elapsed_days:.1f}d ago)"
 
         return False, f"stable (drift={score:.2f}, days_since={elapsed_days:.1f})"
+
+    def apply_to_config(
+        self,
+        genome: Genome,
+        config_path: str = "config/strategy_config.json",
+    ) -> None:
+        """
+        Write genome parameters to a JSON config file.
+
+        The JSON structure is:
+            {
+              "ga_metadata": {"fitness": ..., "updated_at": "..."},
+              "parameters": { <all genome genes as floats/ints> }
+            }
+
+        Existing keys not covered by the genome are preserved.
+        """
+        import datetime
+
+        os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+
+        # Load existing config (if any)
+        existing: dict = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+
+        # Build gene dict (exclude fitness field)
+        gene_data = {
+            name: getattr(genome, name)
+            for name in GENE_BOUNDS
+        }
+
+        existing["parameters"] = {**existing.get("parameters", {}), **gene_data}
+        existing["ga_metadata"] = {
+            "fitness": genome.fitness,
+            "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+
+        with open(config_path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2)
+
+        logger.info(
+            "Optimizer: strategy config written to '%s' (fitness=%.4f)",
+            config_path, genome.fitness,
+        )
+
+    @staticmethod
+    def load_from_config(config_path: str = "config/strategy_config.json") -> Optional[Genome]:
+        """
+        Load a Genome from a JSON config file produced by apply_to_config().
+
+        Returns None if the file does not exist or is malformed.
+        Unknown keys in the JSON are silently ignored.
+        """
+        if not os.path.exists(config_path):
+            return None
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            params = data.get("parameters", {})
+            # Build kwargs, coercing types from GENE_BOUNDS
+            kwargs: dict = {}
+            for name, (lo, hi, is_int) in GENE_BOUNDS.items():
+                if name in params:
+                    v = params[name]
+                    kwargs[name] = int(round(v)) if is_int else float(v)
+            fitness = data.get("ga_metadata", {}).get("fitness", -999.0)
+            g = Genome(**kwargs)
+            g.fitness = float(fitness)
+            return g.clamp()
+        except Exception as exc:
+            logger.warning("Optimizer: failed to load config from '%s': %s", config_path, exc)
+            return None

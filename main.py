@@ -27,12 +27,16 @@ from src.data_fetcher import DataFetcher
 from src.engine_a import EngineA
 from src.engine_b import EngineB
 from src.monitor import DriftLevel, Monitor
+from src.optimizer import Optimizer
 from src.risk_manager import RiskConfig, RiskManager
 from src.state_manager import StateManager
 from src.sweeper import Sweeper
 
 MAX_RETRY_DELAY = 60  # 최대 재연결 대기(초)
 TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "10000.0"))
+OPTIMIZER_CHECK_INTERVAL = int(os.getenv("OPTIMIZER_CHECK_INTERVAL", "3600"))  # 1시간
+OPTIMIZER_BASELINE_CANDLES = 30 * 24 * 60   # 30일 × 1분봉
+OPTIMIZER_RECENT_CANDLES   = 7  * 24 * 60   # 7일 × 1분봉
 
 
 # --- Retry decorator for async tasks ---
@@ -51,6 +55,79 @@ async def run_with_retry(coro_factory, name: str) -> NoReturn:
             logger.error("[%s] 오류 발생: %s — %.1f초 후 재시도", name, exc, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, MAX_RETRY_DELAY)
+
+
+# --- Optimizer scheduler ---
+
+class OptimizerScheduler:
+    """
+    Background scheduler that watches for market drift and triggers
+    GA parameter retraining.
+
+    Maintains a rolling candle buffer (up to 30 days of 1-min candles).
+    Every OPTIMIZER_CHECK_INTERVAL seconds it calls should_retrain(); if
+    triggered it runs run_cycle() in a thread pool (to avoid blocking the
+    event loop) and writes the winning genome to .env + strategy_config.json.
+    """
+
+    ENV_PATH    = os.getenv("OPTIMIZER_ENV_PATH",    ".env")
+    CONFIG_PATH = os.getenv("OPTIMIZER_CONFIG_PATH", "config/strategy_config.json")
+
+    def __init__(self, optimizer: Optimizer, retrain_interval_days: float = 7.0) -> None:
+        self._optimizer = optimizer
+        self._retrain_interval_days = retrain_interval_days
+        self._candle_buffer: list = []
+        self._last_retrain_ts: float = 0.0
+        self._running: bool = False
+
+    def feed_candle(self, candle) -> None:
+        """Append a candle to the rolling buffer (called from _on_candle)."""
+        self._candle_buffer.append(candle)
+        if len(self._candle_buffer) > OPTIMIZER_BASELINE_CANDLES:
+            self._candle_buffer.pop(0)
+
+    async def run(self) -> None:
+        self._running = True
+        logger.info("OptimizerScheduler: 가동 (체크 주기=%ds)", OPTIMIZER_CHECK_INTERVAL)
+        while self._running:
+            await asyncio.sleep(OPTIMIZER_CHECK_INTERVAL)
+            await self._check_and_retrain()
+
+    async def _check_and_retrain(self) -> None:
+        if len(self._candle_buffer) < 100:
+            logger.debug("OptimizerScheduler: 캔들 부족 — 건너뜀")
+            return
+
+        recent   = self._candle_buffer[-OPTIMIZER_RECENT_CANDLES:]
+        baseline = self._candle_buffer
+
+        should, reason = self._optimizer.should_retrain(
+            recent, baseline,
+            last_retrain_ts=self._last_retrain_ts,
+            retrain_interval_days=self._retrain_interval_days,
+        )
+
+        if not should:
+            logger.debug("OptimizerScheduler: 재학습 불필요 — %s", reason)
+            return
+
+        logger.info("OptimizerScheduler: 재학습 트리거 — %s", reason)
+        try:
+            best = await asyncio.get_event_loop().run_in_executor(
+                None, self._optimizer.run_cycle, recent
+            )
+            self._optimizer.apply_to_env(best, env_path=self.ENV_PATH)
+            self._optimizer.apply_to_config(best, config_path=self.CONFIG_PATH)
+            self._last_retrain_ts = time.time()
+            logger.info(
+                "OptimizerScheduler: 파라미터 업데이트 완료 (fitness=%.4f)\n%s",
+                best.fitness, best.summary(),
+            )
+        except Exception as exc:
+            logger.error("OptimizerScheduler: 재학습 실패 — %s", exc, exc_info=True)
+
+    def stop(self) -> None:
+        self._running = False
 
 
 # --- System orchestrator ---
@@ -102,6 +179,16 @@ class TradingSystem:
         # 단계 6: 모니터 (engine_a 참조 전달 → 박스 동적 확대)
         self.monitor = Monitor(engine_a=self.engine_a)
 
+        # 단계 8: 유전 알고리즘 자가 학습 옵티마이저
+        _opt = Optimizer(seed=int(os.getenv("OPTIMIZER_SEED", "0")) or None)
+        # 기존 config.json에 저장된 최적 파라미터가 있으면 기본값으로 로드
+        _saved_genome = Optimizer.load_from_config()
+        if _saved_genome is not None:
+            logger.info(
+                "Optimizer: 저장된 파라미터 로드 (fitness=%.4f)", _saved_genome.fitness
+            )
+        self.opt_scheduler = OptimizerScheduler(_opt)
+
         # 이벤트 연결
         self.fetcher.on_candle_update(self._on_candle)
         self.monitor.on_drift(self._on_drift)
@@ -116,6 +203,10 @@ class TradingSystem:
         else:
             logger.warning("리스크 쿨다운 중 — 엔진 일시 정지 (일일 손실=%.2f)", self.risk_mgr.get_daily_loss())
         await self.monitor.on_market_update(market)
+
+        # 옵티마이저 캔들 버퍼에 공급 (최신 캔들이 있을 때)
+        if market.candles:
+            self.opt_scheduler.feed_candle(market.candles[-1])
 
         # 상태 주기적 저장 (매 캔들마다)
         try:
@@ -173,6 +264,9 @@ class TradingSystem:
                     lambda: self.risk_mgr.reset_daily_at_midnight(), "RiskManager-Reset"
                 )
             ),
+            asyncio.create_task(
+                run_with_retry(lambda: self.opt_scheduler.run(), "OptimizerScheduler")
+            ),
         ]
 
         logger.info("=== edgeX 하이브리드 트레이딩 시스템 가동 ===")
@@ -187,6 +281,7 @@ class TradingSystem:
             self.fetcher.stop()
             self.sweeper.stop()
             self.monitor.stop()
+            self.opt_scheduler.stop()
             logger.info("시스템 정상 종료")
 
 
