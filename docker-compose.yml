@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  trader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - trader_data:/app/data
+    command: ["--log-level", "INFO"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  trader_dryrun:
+    build: .
+    restart: "no"
+    env_file: .env
+    volumes:
+      - trader_data:/app/data
+    command: ["--dry-run", "--log-level", "DEBUG"]
+    profiles: ["dryrun"]
+
+volumes:
+  trader_data:

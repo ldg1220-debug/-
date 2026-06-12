@@ -27,6 +27,8 @@ from src.data_fetcher import DataFetcher
 from src.engine_a import EngineA
 from src.engine_b import EngineB
 from src.monitor import DriftLevel, Monitor
+from src.risk_manager import RiskConfig, RiskManager
+from src.state_manager import StateManager
 from src.sweeper import Sweeper
 
 MAX_RETRY_DELAY = 60  # 최대 재연결 대기(초)
@@ -59,26 +61,43 @@ class TradingSystem:
         if dry_run:
             logger.warning("=== PAPER TRADING (DRY-RUN) 모드 — 실제 주문 없음 ===")
 
+        # 상태 저장소 & 리스크 관리자 (가장 먼저 초기화)
+        self.state_mgr = StateManager()
+        self.risk_cfg = RiskConfig()
+        self.risk_mgr = RiskManager(self.state_mgr, self.risk_cfg)
+
         # 단계 1: 인증
         self.auth_a = EdgeXAuth()
-        self.auth_b = EdgeXAuth()  # 별도 지갑 키를 사용할 경우 PRIVATE_KEY_B 등 env 분리 가능
+        self.auth_b = EdgeXAuth()  # 별도 지갑: PRIVATE_KEY_B env 설정 시 분리 가능
 
         # 단계 2: 데이터 수집기
         self.symbol = os.getenv("SYMBOL", "BTC-USDC")
         self.fetcher = DataFetcher(symbol=self.symbol)
 
-        # 단계 3: 엔진 A
+        # 단계 3: 엔진 A (저장된 상태 복원)
         self.engine_a = EngineA(auth=self.auth_a, symbol=self.symbol, dry_run=dry_run)
         self.engine_a.set_capital(TOTAL_CAPITAL)
+        saved_a = self.state_mgr.load_engine_a_state()
+        if saved_a:
+            self.engine_a.state = saved_a
+            logger.info("엔진 A 상태 복원 완료 (mode=%s)", saved_a.mode.name)
 
-        # 단계 4: 엔진 B
+        # 단계 4: 엔진 B (저장된 포지션 복원)
         self.engine_b = EngineB(auth=self.auth_b, dry_run=dry_run)
         self.engine_b.symbol = self.symbol
         self.engine_b.set_capital(TOTAL_CAPITAL)
+        saved_b = self.state_mgr.load_engine_b_position()
+        if saved_b:
+            self.engine_b.position = saved_b
+            logger.info("엔진 B 포지션 복원 완료 (short=%.4f)", saved_b.edgex_short_size)
 
         # 단계 5: 스위퍼
         self.sweeper = Sweeper(self.engine_a, self.engine_b, dry_run=dry_run)
         self.sweeper.set_initial_capital(TOTAL_CAPITAL * 0.25)
+        saved_sweep = self.state_mgr.load_sweep_history()
+        if saved_sweep:
+            self.sweeper.state.history = saved_sweep
+            self.sweeper.state.total_swept = sum(r.amount_usdc for r in saved_sweep)
 
         # 단계 6: 모니터 (engine_a 참조 전달 → 박스 동적 확대)
         self.monitor = Monitor(engine_a=self.engine_a)
@@ -90,9 +109,21 @@ class TradingSystem:
     # --- Event handlers ---
 
     async def _on_candle(self, market) -> None:
-        await self.engine_a.on_market_update(market)
-        await self.engine_b.on_market_update(market)
+        # 리스크 체크 후 엔진 실행
+        if not self.risk_mgr.is_in_cooldown():
+            await self.engine_a.on_market_update(market)
+            await self.engine_b.on_market_update(market)
+        else:
+            logger.warning("리스크 쿨다운 중 — 엔진 일시 정지 (일일 손실=%.2f)", self.risk_mgr.get_daily_loss())
         await self.monitor.on_market_update(market)
+
+        # 상태 주기적 저장 (매 캔들마다)
+        try:
+            self.state_mgr.save_engine_a_state(self.engine_a.state)
+            self.state_mgr.save_engine_b_position(self.engine_b.position)
+            self.state_mgr.save_sweep_history(self.sweeper.state.history)
+        except Exception as exc:
+            logger.warning("상태 저장 실패: %s", exc)
 
     def _on_drift(self, event) -> None:
         if event.level == DriftLevel.CRITICAL:
@@ -135,6 +166,11 @@ class TradingSystem:
             asyncio.create_task(
                 run_with_retry(
                     lambda: self.monitor.run_periodic_calibration(), "Monitor-Calibration"
+                )
+            ),
+            asyncio.create_task(
+                run_with_retry(
+                    lambda: self.risk_mgr.reset_daily_at_midnight(), "RiskManager-Reset"
                 )
             ),
         ]
