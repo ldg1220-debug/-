@@ -2,11 +2,12 @@
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 import pandas as pd
 import requests
@@ -15,8 +16,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-EDGEX_WS_URL = os.getenv("EDGEX_WS_URL", "wss://testnet-ws.edgex.exchange")
-EDGEX_API_URL = os.getenv("EDGEX_API_URL", "https://testnet-api.edgex.exchange")
+logger = logging.getLogger(__name__)
+
+EDGEX_WS_URL  = os.getenv("EDGEX_WS_URL",  "wss://testnet-ws.edgex.exchange")
+EDGEX_API_URL = os.getenv("EDGEX_API_URL",  "https://testnet-api.edgex.exchange")
 BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
 
 BINANCE_BASE = (
@@ -30,8 +33,9 @@ BINANCE_FAPI = (
     else "https://fapi.binance.com/fapi/v1"
 )
 
-VOLUME_MA_MINUTES = 20  # 20분 평균 거래량 윈도우
-FUNDING_PERIODS_PER_YEAR = 3 * 365  # 8시간마다 펀딩 → 연 1095회
+VOLUME_MA_MINUTES       = int(os.getenv("VOLUME_MA_MINUTES", "20"))
+VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "3.0"))
+FUNDING_PERIODS_PER_YEAR = 3 * 365   # 8시간마다 펀딩 → 연 1095회
 
 
 @dataclass
@@ -96,6 +100,13 @@ def fetch_all_funding_aprs(top_n: int = 20) -> list[dict]:
 
 
 class DataFetcher:
+    """실시간 시세·캔들·펀딩비 수집기.
+
+    WebSocket 틱 스트림에서 분당 거래량을 누적하여 최대 VOLUME_MA_MINUTES개의
+    완성된 분봉 거래량을 메모리 큐에 유지합니다. REST 폴(60초)과 틱 누적이
+    병행되어, 분 경계 전에도 is_volume_spike()로 실시간 스파이크를 감지합니다.
+    """
+
     def __init__(self, symbol: str = "BTC-USDC"):
         self.symbol = symbol
         self.binance_symbol = symbol.replace("-", "")
@@ -103,6 +114,99 @@ class DataFetcher:
         self._price_callbacks: list[Callable] = []
         self._candle_callbacks: list[Callable] = []
         self._running = False
+
+        # ── 실시간 분당 거래량 큐 ─────────────────────────────────────────────
+        # 완성된 1분봉 거래량을 순서대로 저장 (최대 VOLUME_MA_MINUTES개)
+        self._minute_volume_queue: deque[float] = deque(maxlen=VOLUME_MA_MINUTES)
+        # 현재 진행 중인 1분봉에 누적된 거래량
+        self._current_minute_volume: float = 0.0
+        # 현재 분봉의 시작 Unix 타임스탬프 (초, 60 단위로 내림)
+        self._current_minute_ts: int = 0
+
+    # ── REST 스냅샷 ───────────────────────────────────────────────────────────
+
+    def get_current_market_data(self) -> Optional[dict]:
+        """edgeX V2 REST API에서 현재 가격·24h 거래량 스냅샷을 가져옵니다.
+
+        거래소 서버 장애나 포맷 변경에도 봇이 멈추지 않도록 3종의 예외를
+        분리 처리합니다. 실패 시 None을 반환하여 호출부가 다음 틱에서 재시도합니다.
+
+        Returns:
+            {"symbol", "current_price", "volume_24h", "timestamp"} 또는 None
+        """
+        url = f"{EDGEX_API_URL}/v2/ticker"
+        try:
+            # timeout=5: 거래소 서버가 응답하지 않을 때 무한 대기 방지
+            resp = requests.get(url, params={"symbol": self.symbol}, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "symbol": self.symbol,
+                # float() 변환: API는 숫자를 "95250.5" 형태의 문자열로 전송
+                "current_price": float(data["lastPrice"]),
+                "volume_24h":    float(data["volume24h"]),
+                "timestamp":     int(time.time()),
+            }
+        except requests.exceptions.Timeout:
+            logger.warning("[%s] edgeX API 응답 시간 초과 — 다음 틱에서 재시도", self.symbol)
+        except requests.exceptions.RequestException as e:
+            logger.warning("[%s] edgeX API 네트워크 오류: %s", self.symbol, e)
+        except KeyError as e:
+            logger.warning("[%s] edgeX API 응답 포맷 변경 (KeyError: %s)", self.symbol, e)
+        return None
+
+    # ── 실시간 분당 거래량 큐 ─────────────────────────────────────────────────
+
+    def _accumulate_tick_volume(self, qty: float) -> None:
+        """WebSocket 틱 1건의 체결 수량을 현재 분봉에 누적합니다.
+
+        분 경계(xx:xx:00)를 넘으면 완성된 분봉 거래량을 큐에 추가하고
+        새 분봉 카운터를 0부터 시작합니다.
+        """
+        now_min = (int(time.time()) // 60) * 60  # 현재 시각을 60초 단위로 내림
+
+        # 첫 틱: 현재 분봉 타임스탬프 초기화
+        if self._current_minute_ts == 0:
+            self._current_minute_ts = now_min
+
+        # 분 경계 초과 → 지난 분봉을 큐에 저장하고 리셋
+        if now_min > self._current_minute_ts:
+            self._minute_volume_queue.append(self._current_minute_volume)
+            self._current_minute_volume = 0.0
+            self._current_minute_ts = now_min
+            logger.debug(
+                "[%s] 분봉 완성 → 큐 길이=%d", self.symbol, len(self._minute_volume_queue)
+            )
+
+        self._current_minute_volume += qty
+
+    def get_recent_average_volume(self) -> float:
+        """최근 VOLUME_MA_MINUTES분 분당 평균 거래량을 반환합니다.
+
+        WebSocket 틱 큐에 데이터가 쌓이기 전(봇 초기 기동 시)에는
+        REST 폴로 계산한 volume_ma_20m을 폴백으로 사용합니다.
+        """
+        if self._minute_volume_queue:
+            return sum(self._minute_volume_queue) / len(self._minute_volume_queue)
+        # 폴백: REST 폴 기반 MA
+        return self.market_data.volume_ma_20m
+
+    def is_volume_spike(self, multiplier: float = VOLUME_SPIKE_MULTIPLIER) -> bool:
+        """현재 분봉 거래량이 최근 20분 평균의 multiplier배를 초과하면 True.
+
+        Args:
+            multiplier: 스파이크 판정 배수 (기본 3.0, .env의 VOLUME_SPIKE_MULTIPLIER)
+
+        Returns:
+            True  → 거래량 급등 → 엔진 A 돌파 매매 신호
+            False → 정상 범위 → 박스권 그리드 유지
+        """
+        avg = self.get_recent_average_volume()
+        if avg <= 0:
+            return False
+        return self._current_minute_volume >= avg * multiplier
+
+    # ── Callback registration ─────────────────────────────────────────────────
 
     # --- Callback registration ---
 
@@ -189,11 +293,18 @@ class DataFetcher:
                     backoff = 1
                     async for raw in ws:
                         msg = json.loads(raw)
+                        # 가격: edgeX WS는 "p" 또는 "price" 필드로 전달
                         price = float(msg.get("p", 0) or msg.get("price", 0))
                         if price:
                             self.market_data.last_price = price
                             for cb in self._price_callbacks:
                                 await _maybe_await(cb, price)
+
+                        # 체결 수량: "q" 또는 "quantity" 필드
+                        qty_raw = msg.get("q", 0) or msg.get("quantity", 0)
+                        if qty_raw:
+                            self._accumulate_tick_volume(float(qty_raw))
+
             except Exception:
                 if self._running:
                     await asyncio.sleep(min(backoff, 30))
