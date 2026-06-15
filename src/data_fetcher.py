@@ -120,8 +120,8 @@ class DataFetcher:
         self._minute_volume_queue: deque[float] = deque(maxlen=VOLUME_MA_MINUTES)
         # 현재 진행 중인 1분봉에 누적된 거래량
         self._current_minute_volume: float = 0.0
-        # 현재 분봉의 시작 Unix 타임스탬프 (초, 60 단위로 내림)
-        self._current_minute_ts: int = 0
+        # 기동 시점의 분 타임스탬프로 초기화 → "첫 틱" 특수 처리 불필요
+        self._current_minute_ts: int = int(time.time() // 60) * 60
 
     # ── REST 스냅샷 ───────────────────────────────────────────────────────────
 
@@ -145,6 +145,8 @@ class DataFetcher:
                 # float() 변환: API는 숫자를 "95250.5" 형태의 문자열로 전송
                 "current_price": float(data["lastPrice"]),
                 "volume_24h":    float(data["volume24h"]),
+                # volume_ma_20m: edgeX V2가 제공하면 사용, 없으면 0.0 (큐 미충전 폴백용)
+                "volume_ma_20m": float(data.get("volume_ma_20m", 0.0)),
                 "timestamp":     int(time.time()),
             }
         except requests.exceptions.Timeout:
@@ -161,35 +163,39 @@ class DataFetcher:
         """WebSocket 틱 1건의 체결 수량을 현재 분봉에 누적합니다.
 
         분 경계(xx:xx:00)를 넘으면 완성된 분봉 거래량을 큐에 추가하고
-        새 분봉 카운터를 0부터 시작합니다.
+        새 분봉을 qty부터 시작합니다.
         """
-        now_min = (int(time.time()) // 60) * 60  # 현재 시각을 60초 단위로 내림
+        now_min = (int(time.time()) // 60) * 60
 
-        # 첫 틱: 현재 분봉 타임스탬프 초기화
-        if self._current_minute_ts == 0:
-            self._current_minute_ts = now_min
-
-        # 분 경계 초과 → 지난 분봉을 큐에 저장하고 리셋
-        if now_min > self._current_minute_ts:
+        if now_min == self._current_minute_ts:
+            # 같은 분: 틱 거래량 누적
+            self._current_minute_volume += qty
+        else:
+            # 분 경계 초과 → 지난 분봉을 큐에 저장, 새 분봉은 qty로 직접 시작
             self._minute_volume_queue.append(self._current_minute_volume)
-            self._current_minute_volume = 0.0
             self._current_minute_ts = now_min
+            self._current_minute_volume = qty
             logger.debug(
                 "[%s] 분봉 완성 → 큐 길이=%d", self.symbol, len(self._minute_volume_queue)
             )
 
-        self._current_minute_volume += qty
-
     def get_recent_average_volume(self) -> float:
         """최근 VOLUME_MA_MINUTES분 분당 평균 거래량을 반환합니다.
 
-        WebSocket 틱 큐에 데이터가 쌓이기 전(봇 초기 기동 시)에는
-        REST 폴로 계산한 volume_ma_20m을 폴백으로 사용합니다.
+        봇 초기 기동 시 큐 미충전 상태에서는 2단계 폴백을 거칩니다.
+        1차: REST 폴에서 캐시된 volume_ma_20m (네트워크 호출 없음)
+        2차: edgeX REST API 직접 호출 (캐시도 없을 때)
         """
         if self._minute_volume_queue:
             return sum(self._minute_volume_queue) / len(self._minute_volume_queue)
-        # 폴백: REST 폴 기반 MA
-        return self.market_data.volume_ma_20m
+        # 1차 폴백: REST 폴 기반 캐시 (네트워크 없음)
+        if self.market_data.volume_ma_20m > 0:
+            return self.market_data.volume_ma_20m
+        # 2차 폴백: edgeX REST API 직접 호출
+        snapshot = self.get_current_market_data()
+        if snapshot and snapshot.get("volume_ma_20m", 0) > 0:
+            return snapshot["volume_ma_20m"]
+        return 0.0
 
     def is_volume_spike(self, multiplier: float = VOLUME_SPIKE_MULTIPLIER) -> bool:
         """현재 분봉 거래량이 최근 20분 평균의 multiplier배를 초과하면 True.
@@ -206,7 +212,10 @@ class DataFetcher:
             return False
         return self._current_minute_volume >= avg * multiplier
 
-    # ── Callback registration ─────────────────────────────────────────────────
+    @property
+    def current_price(self) -> float:
+        """현재 가격 (WebSocket 스트림에서 갱신, 외부에서 쉽게 접근)."""
+        return self.market_data.last_price
 
     # --- Callback registration ---
 
@@ -286,29 +295,38 @@ class DataFetcher:
     async def _stream_edgex_ws(self) -> None:
         edgex_symbol = self.symbol.replace("-", "_").lower()
         uri = f"{EDGEX_WS_URL}/stream?streams={edgex_symbol}@trade"
+        # edgeX V2 subscribe 메시지 (URL 기반 구독과 병행 — 어느 방식이든 커버)
+        subscribe_msg = json.dumps({
+            "method": "subscribe",
+            "params": {"channel": "trades", "symbol": self.symbol},
+        })
         backoff = 1
         while self._running:
             try:
                 async with websockets.connect(uri, ping_interval=20) as ws:
+                    await ws.send(subscribe_msg)   # V2 subscribe
                     backoff = 1
+                    logger.info("[%s] WS 연결 성공", self.symbol)
                     async for raw in ws:
                         msg = json.loads(raw)
-                        # 가격: edgeX WS는 "p" 또는 "price" 필드로 전달
-                        price = float(msg.get("p", 0) or msg.get("price", 0))
-                        if price:
+                        # price: "price" 우선, 없으면 "p" (Binance 호환)
+                        price_raw = msg.get("price") or msg.get("p")
+                        if price_raw:
+                            price = float(price_raw)
                             self.market_data.last_price = price
                             for cb in self._price_callbacks:
                                 await _maybe_await(cb, price)
 
-                        # 체결 수량: "q" 또는 "quantity" 필드
-                        qty_raw = msg.get("q", 0) or msg.get("quantity", 0)
+                        # quantity: "quantity" 우선, 없으면 "q"
+                        qty_raw = msg.get("quantity") or msg.get("q")
                         if qty_raw:
                             self._accumulate_tick_volume(float(qty_raw))
 
-            except Exception:
+            except Exception as exc:
                 if self._running:
+                    logger.warning("[%s] WS 연결 끊김: %s — %.0fs 후 재연결", self.symbol, exc, backoff)
                     await asyncio.sleep(min(backoff, 30))
-                    backoff *= 2
+                    backoff = min(backoff * 2, 30)
 
     async def _poll_candles(self, interval_sec: int = 60) -> None:
         while self._running:

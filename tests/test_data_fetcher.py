@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, ".")
 
@@ -35,19 +35,17 @@ def make_fetcher() -> DataFetcher:
 
 class TestAccumulateTickVolume(unittest.TestCase):
 
-    def test_first_tick_initializes_minute_ts(self):
-        """첫 번째 틱이 _current_minute_ts를 현재 분 단위로 초기화해야 한다."""
-        f = make_fetcher()
-        self.assertEqual(f._current_minute_ts, 0)
+    def test_init_sets_current_minute_ts(self):
+        """DataFetcher 생성 시 _current_minute_ts가 현재 분 단위로 초기화되어야 한다."""
         now_min = (int(time.time()) // 60) * 60
-        f._accumulate_tick_volume(5.0)
-        self.assertEqual(f._current_minute_ts, now_min)
+        f = make_fetcher()
+        # 생성과 검사 사이에 분이 바뀔 수 있으므로 ±60초 허용
+        self.assertAlmostEqual(f._current_minute_ts, now_min, delta=60)
 
     def test_same_minute_accumulates(self):
         """같은 분 안의 틱들은 합산되어야 한다."""
         f = make_fetcher()
-        now_min = (int(time.time()) // 60) * 60
-        f._current_minute_ts = now_min
+        # _current_minute_ts는 이미 현재 분으로 초기화되어 있음
         f._accumulate_tick_volume(3.0)
         f._accumulate_tick_volume(7.0)
         self.assertAlmostEqual(f._current_minute_volume, 10.0)
@@ -66,11 +64,12 @@ class TestAccumulateTickVolume(unittest.TestCase):
         self.assertAlmostEqual(f._minute_volume_queue[0], 42.0)
 
     def test_minute_boundary_resets_current_volume(self):
-        """분 경계 초과 후 current_minute_volume이 새 틱 수량만 남아야 한다."""
+        """분 경계 초과 후 current_minute_volume이 새 틱 수량만 남아야 한다 (= qty 패턴)."""
         f = make_fetcher()
-        f._current_minute_ts = (int(time.time()) // 60 - 1) * 60
+        f._current_minute_ts = (int(time.time()) // 60 - 1) * 60  # 1분 전
         f._current_minute_volume = 100.0
         f._accumulate_tick_volume(2.5)
+        # 참조 코드와 동일: 리셋 후 `= qty` 직접 대입 → 2.5만 남아야 함
         self.assertAlmostEqual(f._current_minute_volume, 2.5)
 
     def test_queue_maxlen_is_volume_ma_minutes(self):
@@ -141,6 +140,30 @@ class TestGetRecentAverageVolume(unittest.TestCase):
         f.market_data.volume_ma_20m = 999.0  # 큰 값 세팅
         f._minute_volume_queue.append(10.0)
         self.assertAlmostEqual(f.get_recent_average_volume(), 10.0)
+
+    def test_empty_queue_and_zero_cache_falls_back_to_rest_api(self):
+        """큐도 비고 캐시도 0이면 REST API를 직접 호출해 volume_ma_20m을 반환해야 한다."""
+        f = make_fetcher()
+        f.market_data.volume_ma_20m = 0.0  # 캐시도 없음
+        with patch.object(f, "get_current_market_data", return_value={"volume_ma_20m": 77.7}):
+            result = f.get_recent_average_volume()
+        self.assertAlmostEqual(result, 77.7)
+
+    def test_all_fallbacks_fail_returns_zero(self):
+        """큐, 캐시, REST API 모두 값이 없으면 0.0을 반환해야 한다."""
+        f = make_fetcher()
+        f.market_data.volume_ma_20m = 0.0
+        with patch.object(f, "get_current_market_data", return_value=None):
+            result = f.get_recent_average_volume()
+        self.assertAlmostEqual(result, 0.0)
+
+    def test_rest_api_fallback_not_called_when_cache_exists(self):
+        """캐시에 값이 있으면 REST API를 호출하지 않아야 한다 (불필요한 네트워크 절약)."""
+        f = make_fetcher()
+        f.market_data.volume_ma_20m = 42.0
+        with patch.object(f, "get_current_market_data") as mock_api:
+            f.get_recent_average_volume()
+        mock_api.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -281,6 +304,26 @@ class TestGetCurrentMarketData(unittest.TestCase):
             f.get_current_market_data()
         _, kwargs = mock_get.call_args
         self.assertEqual(kwargs.get("timeout"), 5)
+
+    def test_volume_ma_20m_present_when_api_provides_it(self):
+        """API가 volume_ma_20m을 포함하면 그대로 반환해야 한다."""
+        f = make_fetcher()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._mock_response(
+                {"lastPrice": "50000.0", "volume24h": "200.0", "volume_ma_20m": "88.8"}
+            )
+            result = f.get_current_market_data()
+        self.assertAlmostEqual(result["volume_ma_20m"], 88.8)
+
+    def test_volume_ma_20m_defaults_to_zero_when_absent(self):
+        """API 응답에 volume_ma_20m이 없으면 0.0으로 기본값 처리해야 한다."""
+        f = make_fetcher()
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._mock_response(
+                {"lastPrice": "50000.0", "volume24h": "200.0"}
+            )
+            result = f.get_current_market_data()
+        self.assertAlmostEqual(result["volume_ma_20m"], 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
