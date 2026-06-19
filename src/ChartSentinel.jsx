@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { scanMarket } from "./signalEngine.js";
 
 // 한글/영문 → 실제 티커 매핑. 크립토는 Yahoo Finance 규칙(-USD)에 맞춤.
 const TICKER_MAP = {
@@ -121,6 +122,61 @@ async function fetchCoinGeckoChartImage(resolvedTicker, days = 30) {
   ctx.fillText(`Low: $${min.toLocaleString()}`, W - PAD - 140, H - 8);
 
   return canvas.toDataURL("image/png").split(",")[1]; // base64 only
+}
+
+// CoinGecko 시가총액 상위 N개 코인의 id/심볼 목록을 가져온다 (페이지당 최대 250개).
+async function fetchTopCoinIds(n) {
+  const perPage = Math.min(n, 250);
+  const pages = Math.ceil(n / perPage);
+  const ids = [];
+  for (let page = 1; page <= pages; page++) {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=${page}`
+    );
+    if (!res.ok) throw new Error(`마켓 목록 조회 실패: HTTP ${res.status}`);
+    const data = await res.json();
+    ids.push(...data.map((c) => ({ id: c.id, symbol: c.symbol.toUpperCase() })));
+  }
+  return ids.slice(0, n);
+}
+
+// 단일 코인의 시간봉 가격/거래량 시계열을 가져온다. CoinGecko 무료 티어 레이트리밋(429)에
+// 걸리면 8초 대기 후 재시도한다 — 수십~수백 개를 순차 조회할 때 필수.
+async function fetchCoinSeries(coinId, days = 90) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      return { prices: data.prices.map((p) => p[1]), volumes: data.total_volumes.map((v) => v[1]) };
+    }
+    if (res.status === 429) {
+      await new Promise((r) => setTimeout(r, 8000));
+      continue;
+    }
+    throw new Error(`HTTP ${res.status}`);
+  }
+  throw new Error("레이트리밋 재시도 초과");
+}
+
+// 다종목 스캐너: 상위 N개 코인을 순차 조회해 signalEngine.scanMarket으로 신호를 뽑는다.
+// onProgress(done, total)로 진행 상황을 보고한다.
+async function scanTopCoins(n, days, onProgress) {
+  const coins = await fetchTopCoinIds(n);
+  const assets = [];
+  for (let i = 0; i < coins.length; i++) {
+    const { id, symbol } = coins[i];
+    try {
+      const { prices, volumes } = await fetchCoinSeries(id, days);
+      assets.push({ symbol, prices, volumes });
+    } catch {
+      // 데이터 부족/조회 실패 종목은 스캔 대상에서 제외하고 계속 진행
+    }
+    onProgress?.(i + 1, coins.length);
+    await new Promise((r) => setTimeout(r, 1300)); // 레이트리밋 회피용 호출 간격
+  }
+  return scanMarket(assets);
 }
 
 function buildSystemPrompt(assetType) {
@@ -362,6 +418,11 @@ export default function ChartSentinel() {
   const [logs, setLogs] = useState([]);
   const [error, setError] = useState(null);
   const [fetchingChart, setFetchingChart] = useState(false);
+  const [scanN, setScanN] = useState(30);
+  const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState(null);
+  const [scanResults, setScanResults] = useState(null);
+  const [scanError, setScanError] = useState(null);
   const fileRef = useRef(null);
 
   const key = tickerInput.trim();
@@ -469,13 +530,28 @@ export default function ChartSentinel() {
 
   const canSubmit = !loading && (tickerInput.trim() || imageB64);
 
+  const runScan = async () => {
+    setScanning(true);
+    setScanError(null);
+    setScanResults(null);
+    setScanProgress({ done: 0, total: scanN });
+    try {
+      const results = await scanTopCoins(scanN, 90, (done, total) => setScanProgress({ done, total }));
+      setScanResults(results);
+    } catch (e) {
+      setScanError("스캔 실패: " + e.message);
+    } finally {
+      setScanning(false);
+    }
+  };
+
   return (
     <div style={S.wrap}>
       <style>{`* { box-sizing:border-box; } input:focus { border-color:#38d4c8 !important; } button:hover:not(:disabled) { opacity:0.85; }`}</style>
       <div style={S.header}>
         <span style={S.logo}>◈ CHART SENTINEL v5</span>
         <div style={S.tabs}>
-          {[["analyze", "분석"], ["logs", "기록"]].map(([v, l]) => (
+          {[["analyze", "분석"], ["scanner", "스캐너"], ["logs", "기록"]].map(([v, l]) => (
             <button key={v} type="button" style={S.tab(tab === v)} onClick={() => setTab(v)}>{l}</button>
           ))}
         </div>
@@ -548,6 +624,61 @@ export default function ChartSentinel() {
 
             {loading && <Loader />}
             {report && !loading && <ReportView r={report} />}
+          </>
+        ) : tab === "scanner" ? (
+          <>
+            <div style={S.card}>
+              <label style={S.label}>스캔 대상 코인 수 (시가총액 상위 N)</label>
+              <input
+                style={S.input}
+                type="number"
+                min={1}
+                max={250}
+                value={scanN}
+                onChange={(e) => setScanN(Math.max(1, Math.min(250, parseInt(e.target.value) || 1)))}
+                disabled={scanning}
+              />
+              <div style={{ fontSize: "11px", color: "#566a85", marginTop: "6px" }}>
+                코인당 약 1.3초 소요 (CoinGecko 레이트리밋 회피) · 90일 시간봉 데이터 기준
+              </div>
+              <button type="button" style={{ ...S.btn(scanning), marginTop: "10px" }} onClick={runScan} disabled={scanning}>
+                {scanning ? `스캔 중... (${scanProgress?.done ?? 0}/${scanProgress?.total ?? scanN})` : "▶  시장 스캔 시작"}
+              </button>
+            </div>
+
+            {scanError && <div style={{ ...S.card, borderColor: "#ff506440", color: "#ff8090", fontSize: "13px" }}>⚠ {scanError}</div>}
+
+            {scanResults && (
+              <div style={{ fontSize: "12px", color: "#566a85", marginBottom: "12px", letterSpacing: "1px" }}>
+                신호 발생 종목 {scanResults.length}건 (확신도 내림차순)
+              </div>
+            )}
+
+            {scanResults && scanResults.length === 0 && (
+              <div style={{ ...S.card, textAlign: "center", color: "#566a85", fontSize: "13px", padding: "40px" }}>
+                현재 신호 조건을 만족하는 종목이 없습니다
+              </div>
+            )}
+
+            {scanResults?.map((r, i) => (
+              <div key={i} style={S.logCard}>
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 600 }}>
+                    {r.symbol} <span style={{ color: "#566a85", fontSize: "12px" }}>{r.indicators?.regime}</span>
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#566a85", marginTop: "3px" }}>
+                    진입 {r.entry?.toFixed?.(4) ?? r.entry} · 손절 {r.stopLoss?.toFixed?.(4) ?? r.stopLoss}
+                    {r.target ? ` · 목표 ${r.target.map((t) => t.toFixed(4)).join(" → ")}` : ""}
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "4px" }}>
+                  <span style={S.tag(r.position)}>{r.position}</span>
+                  <span style={{ fontSize: "11px", color: r.confidence >= 7 ? "#38d898" : "#f0c040" }}>
+                    확신도 {r.confidence}/10
+                  </span>
+                </div>
+              </div>
+            ))}
           </>
         ) : (
           <>
