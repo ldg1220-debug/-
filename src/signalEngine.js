@@ -143,12 +143,14 @@ export function elliottWaveHint(pivots) {
 // 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
 export function generateSignal(prices, opts = {}, volumes = null) {
   const {
-    shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05,
-    atrPeriod = 14, atrMultiplier = 1.5, riskReward = 2,
+    shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
+    atrPeriod = 14, atrMultiplier = 1.5, riskReward = 1,
     volumePeriod = 20, volumeMultiplier = 1.2,
+    scoreThreshold = 3, trendFilterPeriod = null,
   } = opts;
-  if (prices.length < longPeriod + 2) {
-    throw new Error(`신호 계산에 최소 ${longPeriod + 2}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
+  const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
+  if (prices.length < minNeeded) {
+    throw new Error(`신호 계산에 최소 ${minNeeded}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
   }
 
   const emaShort = ema(prices, shortPeriod);
@@ -215,9 +217,21 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     reasons.push("거래량 부족 (신호 신뢰도 하향)");
   }
 
+  // 장기 추세 필터: 큰 흐름과 반대되는 신호는 걸러내 승률을 높인다 (역추세 매매 차단).
+  let longTrendUp = null;
+  if (trendFilterPeriod) {
+    const emaLongTerm = ema(prices, trendFilterPeriod);
+    const curLongTerm = emaLongTerm[last];
+    if (curLongTerm != null) {
+      longTrendUp = curPrice > curLongTerm;
+      if (longTrendUp && score < 0) { score += 1; reasons.push(`장기추세(EMA${trendFilterPeriod}) 상승 중 - 매도 신호 약화`); }
+      if (!longTrendUp && score > 0) { score -= 1; reasons.push(`장기추세(EMA${trendFilterPeriod}) 하락 중 - 매수 신호 약화`); }
+    }
+  }
+
   let position = "관망";
-  if (score >= 2) position = "매수";
-  else if (score <= -2) position = "매도";
+  if (score >= scoreThreshold) position = "매수";
+  else if (score <= -scoreThreshold) position = "매도";
 
   // ATR 기반 동적 손절/목표가: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
   const curAtr = atrSeries[last];
@@ -250,6 +264,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
       fibonacci: fib,
       elliott: wave,
       volumeConfirmed: volConfirmed,
+      longTrendUp,
     },
   };
 }
@@ -257,8 +272,13 @@ export function generateSignal(prices, opts = {}, volumes = null) {
 // 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치 | 목표가 터치) 시 청산.
 // 손절/목표가를 실제로 체결에 반영해야 ATR 기반 리스크관리 효과를 검증할 수 있다.
 export function backtest(prices, opts = {}, volumes = null) {
-  const { shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05, useStopLoss = true, useTarget = true } = opts;
-  const minBars = longPeriod + 2;
+  const {
+    shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
+    useStopLoss = true, useTarget = true,
+    atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+    volumePeriod, volumeMultiplier,
+  } = opts;
+  const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
   let holding = false;
   let entryPrice = null;
@@ -288,7 +308,11 @@ export function backtest(prices, opts = {}, volumes = null) {
     const volWindow = volumes ? volumes.slice(0, i + 1) : null;
     let sig;
     try {
-      sig = generateSignal(window, { shortPeriod, longPeriod, rsiPeriod, zigzagPct }, volWindow);
+      sig = generateSignal(window, {
+        shortPeriod, longPeriod, rsiPeriod, zigzagPct,
+        atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+        volumePeriod, volumeMultiplier,
+      }, volWindow);
     } catch {
       continue;
     }
