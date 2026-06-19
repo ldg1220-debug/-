@@ -329,9 +329,13 @@ class EngineB:
             return
         if diff > 0:
             binance_sym = self.symbol.replace("-USDC", "USDT")
-            await self._open_binance_long_async(binance_sym, diff, market.last_price)
+            result = await self._open_binance_long_async(binance_sym, diff, market.last_price)
+            if not isinstance(result, Exception) and result is not None:
+                self.position.binance_long_size += diff
         else:
-            await self._open_edgex_short_async(self.symbol, market.last_price, -diff)
+            result = await self._open_edgex_short_async(self.symbol, market.last_price, -diff)
+            if not isinstance(result, Exception) and result is not None:
+                self.position.edgex_short_size += -diff
         self.position.last_rebalance_time = now
 
     # --- Funding tracking ---

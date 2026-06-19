@@ -440,6 +440,67 @@ class TestDryRunBinanceEntryPrice(unittest.TestCase):
         self.assertAlmostEqual(called_price, 55_000.0)
 
 
+class TestRebalanceUpdatesPositionSize(unittest.TestCase):
+    """rebalance()가 주문 체결 후 position 사이즈를 갱신해야 한다.
+    갱신하지 않으면 델타 불일치가 영원히 해소되지 않아 쿨다운(300초)마다
+    동일한 보정 주문이 무한 반복된다."""
+
+    def test_binance_size_increases_after_rebalance(self):
+        engine = make_engine(dry_run=True)
+        engine.position.edgex_short_size = 0.125
+        engine.position.binance_long_size = 0.0625
+        engine.position.last_rebalance_time = 0.0
+        market = make_market(price=60_000.0)
+        asyncio.run(engine.rebalance(market))
+        self.assertAlmostEqual(engine.position.binance_long_size, 0.125)
+        self.assertTrue(engine.is_delta_neutral())
+
+    def test_edgex_size_increases_after_rebalance(self):
+        engine = make_engine(dry_run=True)
+        engine.position.edgex_short_size = 0.0625
+        engine.position.binance_long_size = 0.125
+        engine.position.last_rebalance_time = 0.0
+        market = make_market(price=60_000.0)
+        asyncio.run(engine.rebalance(market))
+        self.assertAlmostEqual(engine.position.edgex_short_size, 0.125)
+        self.assertTrue(engine.is_delta_neutral())
+
+    def test_no_repeated_rebalance_once_neutral(self):
+        """리밸런스 후 델타가 0에 가까워지면 더 이상 보정 주문을 내지 않아야 한다."""
+        engine = make_engine(dry_run=True)
+        engine.position.edgex_short_size = 0.125
+        engine.position.binance_long_size = 0.0625
+        engine.position.last_rebalance_time = 0.0
+        market = make_market(price=60_000.0)
+        asyncio.run(engine.rebalance(market))
+
+        call_count = 0
+        orig = engine._open_binance_long_async
+
+        async def counting(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            return await orig(*a, **kw)
+
+        engine._open_binance_long_async = counting
+        engine.position.last_rebalance_time = 0.0
+        asyncio.run(engine.rebalance(market))
+        self.assertEqual(call_count, 0)
+
+    def test_position_unchanged_when_order_fails(self):
+        """주문이 실패(None 반환)하면 position 사이즈를 갱신하지 않아야 한다."""
+        engine = make_engine(dry_run=True)
+        engine.position.edgex_short_size = 0.125
+        engine.position.binance_long_size = 0.0625
+        engine.position.last_rebalance_time = 0.0
+        market = make_market(price=60_000.0)
+        with patch.object(
+            engine, "_open_binance_long_async", new=AsyncMock(return_value=None)
+        ):
+            asyncio.run(engine.rebalance(market))
+        self.assertAlmostEqual(engine.position.binance_long_size, 0.0625)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # on_market_update 통합 검증
 # ═══════════════════════════════════════════════════════════════════════════════
