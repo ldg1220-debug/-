@@ -405,3 +405,27 @@ export function backtest(prices, opts = {}, volumes = null) {
     finalPosition: lastPosition,
   };
 }
+
+// 다종목 스캐너 — "단타로 하루 수십 차례 거래"를 한 종목의 신호를 억지로 늘려서
+// 채우면 품질이 무너진다(실측: scoreThreshold를 3→2로 낮추자 11종목 합산 승률이
+// 49.5%→45.1%, 수익이 +19.72%→-39.01%로 붕괴). 대신 같은 품질 기준(scoreThreshold=3)을
+// 유지한 채 여러 종목을 동시에 감시해서 그중 신호가 뜬 종목에만 들어가는 방식으로
+// 빈도를 확보한다. 실측 기준 종목당 평균 약 0.09건/일(시간봉, 90일)이 나오므로,
+// 하루 수십 건을 채우려면 코인 수를 충분히 늘려서 스캔해야 한다(예: 30건/일을
+// 노리면 약 300개 종목 스캔 필요).
+//
+// assets: [{ symbol, prices, volumes }, ...] — 각 종목의 최신 시점까지의 시계열.
+// 반환: 관망이 아닌(매수/매도) 종목만 확신도 내림차순으로 정렬해 반환한다.
+export function scanMarket(assets, opts = {}) {
+  const signals = [];
+  for (const { symbol, prices, volumes } of assets) {
+    let sig;
+    try {
+      sig = generateSignal(prices, opts, volumes);
+    } catch {
+      continue;
+    }
+    if (sig.position !== "관망") signals.push({ symbol, ...sig });
+  }
+  return signals.sort((a, b) => b.confidence - a.confidence);
+}
