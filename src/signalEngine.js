@@ -155,6 +155,26 @@ export function elliottWaveHint(pivots) {
   return { wavePosition: label, lastSwingDirection: lastDir, waveCount: n };
 }
 
+// 타임프레임별 검증된 파라미터 프리셋. 일봉과 시간봉은 변동성/신호 빈도가 달라
+// 같은 파라미터를 쓰면 한쪽이 무너진다(실측: 일봉 튠 파라미터를 시간봉에 그대로
+// 쓰면 승률이 47.7%로 하락). opts에 명시된 값은 프리셋을 덮어쓴다.
+const TIMEFRAME_PRESETS = {
+  daily: {
+    shortPeriod: 8, longPeriod: 21, atrMultiplier: 2, riskReward: 0.8,
+    scoreThreshold: 3, erTrendThreshold: 0.3, breakoutLookback: 50,
+    trendScoreThreshold: 2, trendAtrMultiplier: 2.5,
+  },
+  hourly: {
+    shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
+    scoreThreshold: 3, erTrendThreshold: 0.7,
+  },
+};
+
+function withTimeframePreset(opts) {
+  const preset = TIMEFRAME_PRESETS[opts.timeframe] || {};
+  return { ...preset, ...opts };
+}
+
 // 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
 export function generateSignal(prices, opts = {}, volumes = null) {
   const {
@@ -164,7 +184,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     scoreThreshold = 3, trendFilterPeriod = null,
     erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
     breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
-  } = opts;
+  } = withTimeframePreset(opts);
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
     throw new Error(`신호 계산에 최소 ${minNeeded}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
@@ -346,7 +366,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
-  } = opts;
+  } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
   let holding = false;
