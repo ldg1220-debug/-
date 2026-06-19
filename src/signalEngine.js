@@ -44,6 +44,21 @@ export function atr(values, period = 14) {
   return out;
 }
 
+// Kaufman's Efficiency Ratio — 추세/횡보 판별용.
+// ADX는 OHLC 고저가가 필요하지만 이 엔진은 종가 시계열만 받으므로 ADX를 쓸 수 없다.
+// ER = |순변화량| / 변화량 절대값의 합 (0~1). 1에 가까우면 한 방향으로 곧게 움직인
+// "추세장", 0에 가까우면 오르락내리락만 반복한 "횡보장"으로 본다.
+export function efficiencyRatio(values, period = 14) {
+  const out = new Array(values.length).fill(null);
+  for (let i = period; i < values.length; i++) {
+    const netChange = Math.abs(values[i] - values[i - period]);
+    let volatility = 0;
+    for (let k = i - period + 1; k <= i; k++) volatility += Math.abs(values[k] - values[k - 1]);
+    out[i] = volatility === 0 ? 0 : netChange / volatility;
+  }
+  return out;
+}
+
 // 거래량 확인: 현재 거래량이 평균 대비 기준치 이상이면 신호에 신뢰도를 더한다.
 export function volumeConfirmed(volumes, period = 20, multiplier = 1.2) {
   if (!volumes || volumes.length <= period) return null;
@@ -147,6 +162,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     atrPeriod = 14, atrMultiplier = 1.5, riskReward = 1,
     volumePeriod = 20, volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
+    erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 2,
   } = opts;
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
@@ -157,6 +173,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   const emaLong = ema(prices, longPeriod);
   const rsiSeries = rsi(prices, rsiPeriod);
   const atrSeries = atr(prices, atrPeriod);
+  const erSeries = efficiencyRatio(prices, erPeriod);
   const pivots = zigzag(prices, zigzagPct);
   const wave = elliottWaveHint(pivots);
 
@@ -191,6 +208,13 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     }
   }
 
+  // 시장 국면 판별: ER이 높으면(추세장) 추세추종 모드 - 목표가를 고정하지 않고
+  // 트레일링 스탑으로 수익을 최대한 끌고 간다. ER이 낮으면(횡보장) 단타 모드 -
+  // 기존처럼 손익비를 고정한 빠른 익절/손절을 사용한다. 단일 종목/단일 전략에
+  // 고정하지 않고 같은 자산이라도 구간에 따라 모드를 전환하기 위한 장치다.
+  const curEr = erSeries[last];
+  const regime = curEr != null && curEr >= erTrendThreshold ? "추세" : "횡보";
+
   const reasons = [];
   let score = 0; // -3..+3
 
@@ -217,6 +241,8 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     reasons.push("거래량 부족 (신호 신뢰도 하향)");
   }
 
+  reasons.push(curEr != null ? `효율성비율 ${curEr.toFixed(2)} (${regime})` : `효율성비율 산출불가 (${regime})`);
+
   // 장기 추세 필터: 큰 흐름과 반대되는 신호는 걸러내 승률을 높인다 (역추세 매매 차단).
   let longTrendUp = null;
   if (trendFilterPeriod) {
@@ -239,7 +265,9 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   const stopLoss = position === "매수" ? curPrice - riskDistance
     : position === "매도" ? curPrice + riskDistance
     : null;
-  const target = position === "매수"
+  // 추세 모드에서는 목표가를 정해두지 않고(null) 백테스트에서 트레일링 스탑으로 관리한다.
+  const target = regime === "추세" ? null
+    : position === "매수"
     ? [curPrice + riskDistance * riskReward, curPrice + riskDistance * riskReward * 1.5]
     : position === "매도"
     ? [curPrice - riskDistance * riskReward, curPrice - riskDistance * riskReward * 1.5]
@@ -258,6 +286,8 @@ export function generateSignal(prices, opts = {}, volumes = null) {
       emaLong: curEmaLong,
       rsi: curRsi,
       atr: curAtr,
+      efficiencyRatio: curEr,
+      regime,
       trend: trendUp ? "상승" : "하락",
       goldenCross,
       deadCross,
@@ -271,12 +301,22 @@ export function generateSignal(prices, opts = {}, volumes = null) {
 
 // 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치 | 목표가 터치) 시 청산.
 // 손절/목표가를 실제로 체결에 반영해야 ATR 기반 리스크관리 효과를 검증할 수 있다.
+//
+// 국면별 청산 방식 분리 (단타 vs 추세매매):
+//  - 진입 시점의 시장 국면(regime)이 "횡보"면 기존처럼 ATR 기반 고정 손절/목표가로
+//    빠르게 익절/손절하는 단타 방식을 그대로 쓴다.
+//  - "추세"면 목표가를 두지 않고, 진입 후 갈아탄 최고가(롱) 대비 ATR*trailMultiplier
+//    만큼 따라오는 트레일링 스탑만 사용해 추세가 꺾이기 전까지 수익을 최대한 끌고 간다.
+//    같은 엔진/같은 자산이라도 구간별 국면에 따라 자동으로 전략을 바꾸는 자율 전환 장치.
+//  - feeRatePct: 왕복(진입+청산) 거래 수수료/슬리피지를 퍼센트로 차감한다. 레버리지는
+//    수익률에 단순 배율로 곱해지므로(청산가 도달 위험은 별도 고려 필요) leverage로 적용한다.
 export function backtest(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
     useStopLoss = true, useTarget = true,
-    atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
-    volumePeriod, volumeMultiplier,
+    atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+    volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
+    trailMultiplier = 2, feeRatePct = 0.1, leverage = 1,
   } = opts;
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -284,23 +324,36 @@ export function backtest(prices, opts = {}, volumes = null) {
   let entryPrice = null;
   let activeStop = null;
   let activeTarget = null;
+  let entryRegime = null;
+  let highestSinceEntry = null;
   let lastPosition = "관망";
 
+  const atrSeries = atr(prices, atrPeriod);
+
+  const closeTrade = (exitPrice, exitReason) => {
+    const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
+    const returnPct = grossPct - feeRatePct;
+    trades.push({ entryPrice, exitPrice, returnPct, exitReason, regime: entryRegime });
+    holding = false;
+    entryPrice = null;
+    activeStop = null;
+    activeTarget = null;
+    entryRegime = null;
+    highestSinceEntry = null;
+  };
+
   for (let i = minBars; i < prices.length; i++) {
+    if (holding && entryRegime === "추세") {
+      highestSinceEntry = Math.max(highestSinceEntry, prices[i]);
+      const curAtr = atrSeries[i];
+      if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
+    }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
-      trades.push({ entryPrice, exitPrice: activeStop, returnPct: (activeStop - entryPrice) / entryPrice * 100, exitReason: "stop_loss" });
-      holding = false;
-      entryPrice = null;
-      activeStop = null;
-      activeTarget = null;
+      closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss");
       continue;
     }
     if (holding && useTarget && activeTarget != null && prices[i] >= activeTarget) {
-      trades.push({ entryPrice, exitPrice: activeTarget, returnPct: (activeTarget - entryPrice) / entryPrice * 100, exitReason: "take_profit" });
-      holding = false;
-      entryPrice = null;
-      activeStop = null;
-      activeTarget = null;
+      closeTrade(activeTarget, "take_profit");
       continue;
     }
 
@@ -310,8 +363,8 @@ export function backtest(prices, opts = {}, volumes = null) {
     try {
       sig = generateSignal(window, {
         shortPeriod, longPeriod, rsiPeriod, zigzagPct,
-        atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
-        volumePeriod, volumeMultiplier,
+        atrPeriod, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+        volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold, trailMultiplier,
       }, volWindow);
     } catch {
       continue;
@@ -320,22 +373,18 @@ export function backtest(prices, opts = {}, volumes = null) {
     if (!holding && sig.position === "매수") {
       holding = true;
       entryPrice = prices[i];
+      entryRegime = sig.indicators.regime;
       activeStop = sig.stopLoss;
-      activeTarget = sig.target ? sig.target[0] : null;
+      activeTarget = entryRegime === "추세" ? null : (sig.target ? sig.target[0] : null);
+      highestSinceEntry = entryRegime === "추세" ? prices[i] : null;
     } else if (holding && sig.position === "매도") {
-      const exitPrice = prices[i];
-      trades.push({ entryPrice, exitPrice, returnPct: (exitPrice - entryPrice) / entryPrice * 100, exitReason: "signal_flip" });
-      holding = false;
-      entryPrice = null;
-      activeStop = null;
-      activeTarget = null;
+      closeTrade(prices[i], "signal_flip");
     }
     lastPosition = sig.position;
   }
 
   if (holding) {
-    const exitPrice = prices[prices.length - 1];
-    trades.push({ entryPrice, exitPrice, returnPct: (exitPrice - entryPrice) / entryPrice * 100, exitReason: "open_at_end" });
+    closeTrade(prices[prices.length - 1], "open_at_end");
   }
 
   const wins = trades.filter((t) => t.returnPct > 0).length;
