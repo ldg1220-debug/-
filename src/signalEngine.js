@@ -163,7 +163,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     volumePeriod = 20, volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
     erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
-    breakoutLookback = 20,
+    breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
   } = opts;
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
@@ -256,9 +256,14 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     }
   }
 
+  // 횡보(단타) 모드는 승률을 우선해 엄격한 scoreThreshold를 쓰고, 추세 모드는
+  // 승률보다 손익비를 우선하므로(소수의 큰 추세를 잡는 게 목적) 더 낮은
+  // trendScoreThreshold로 진입 기회 자체를 넓힌다 — 대신 아래의 돌파/ER상승
+  // 확인으로 품질을 보강한다.
+  const effectiveThreshold = regime === "추세" ? trendScoreThreshold : scoreThreshold;
   let position = "관망";
-  if (score >= scoreThreshold) position = "매수";
-  else if (score <= -scoreThreshold) position = "매도";
+  if (score >= effectiveThreshold) position = "매수";
+  else if (score <= -effectiveThreshold) position = "매도";
 
   // 추세추종 진입 보강: EMA 골든/데드크로스만으로는 추세가 이미 꺾이기 시작한
   // 끝물에 들어가 트레일링 스탑에 바로 걸리는 경우가 대부분이었다(실측: 19건 중
@@ -277,8 +282,11 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   }
 
   // ATR 기반 동적 손절/목표가: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
+  // 추세 모드는 초기 손절을 더 넓게 잡아야(trendAtrMultiplier) 진입 직후 흔들림에
+  // 바로 털리지 않고 트레일링 스탑까지 갈 기회를 준다.
   const curAtr = atrSeries[last];
-  const riskDistance = curAtr != null ? curAtr * atrMultiplier : curPrice * 0.02;
+  const effectiveAtrMultiplier = regime === "추세" ? trendAtrMultiplier : atrMultiplier;
+  const riskDistance = curAtr != null ? curAtr * effectiveAtrMultiplier : curPrice * 0.02;
   const stopLoss = position === "매수" ? curPrice - riskDistance
     : position === "매도" ? curPrice + riskDistance
     : null;
@@ -337,7 +345,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
-    breakoutLookback,
+    breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
   } = opts;
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -388,7 +396,7 @@ export function backtest(prices, opts = {}, volumes = null) {
         shortPeriod, longPeriod, rsiPeriod, zigzagPct,
         atrPeriod, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
         volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold, trailMultiplier,
-        breakoutLookback,
+        breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
       }, volWindow);
     } catch {
       continue;
