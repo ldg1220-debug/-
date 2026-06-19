@@ -308,15 +308,18 @@ export function generateSignal(prices, opts = {}, volumes = null) {
 //  - "추세"면 목표가를 두지 않고, 진입 후 갈아탄 최고가(롱) 대비 ATR*trailMultiplier
 //    만큼 따라오는 트레일링 스탑만 사용해 추세가 꺾이기 전까지 수익을 최대한 끌고 간다.
 //    같은 엔진/같은 자산이라도 구간별 국면에 따라 자동으로 전략을 바꾸는 자율 전환 장치.
-//  - feeRatePct: 왕복(진입+청산) 거래 수수료/슬리피지를 퍼센트로 차감한다. 레버리지는
-//    수익률에 단순 배율로 곱해지므로(청산가 도달 위험은 별도 고려 필요) leverage로 적용한다.
+//  - makerFeePct/takerFeePct: 거래소 메이커/테이커 수수료(예: 0.015% / 0.036%). 진입은
+//    신호 발생 즉시 체결되는 시장가(테이커)로 가정한다. 청산은 take_profit만 목표가에
+//    걸어둔 리밋 주문(메이커)으로, 그 외(손절/트레일링/신호전환/만기청산)는 즉시 체결이
+//    필요한 시장가(테이커)로 가정해 거래별로 다른 수수료를 차감한다. 레버리지는 수익률에
+//    단순 배율로 곱해지므로(강제청산 위험은 별도 고려 필요) leverage로 적용한다.
 export function backtest(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
     useStopLoss = true, useTarget = true,
     atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
-    trailMultiplier = 2, feeRatePct = 0.1, leverage = 1,
+    trailMultiplier = 2, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
   } = opts;
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -332,8 +335,10 @@ export function backtest(prices, opts = {}, volumes = null) {
 
   const closeTrade = (exitPrice, exitReason) => {
     const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
-    const returnPct = grossPct - feeRatePct;
-    trades.push({ entryPrice, exitPrice, returnPct, exitReason, regime: entryRegime });
+    const exitFeePct = exitReason === "take_profit" ? makerFeePct : takerFeePct;
+    const feePct = takerFeePct + exitFeePct; // 진입(테이커) + 청산(주문유형별)
+    const returnPct = grossPct - feePct;
+    trades.push({ entryPrice, exitPrice, returnPct, exitReason, regime: entryRegime, feePct });
     holding = false;
     entryPrice = null;
     activeStop = null;
