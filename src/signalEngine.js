@@ -159,7 +159,7 @@ export function elliottWaveHint(pivots) {
 export function generateSignal(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
-    atrPeriod = 14, atrMultiplier = 2, riskReward = 1.5,
+    atrPeriod = 14, atrMultiplier = 2, riskReward = 0.8,
     volumePeriod = 20, volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
     erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
