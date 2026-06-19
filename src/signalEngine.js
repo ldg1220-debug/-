@@ -158,11 +158,11 @@ export function elliottWaveHint(pivots) {
 // 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
 export function generateSignal(prices, opts = {}, volumes = null) {
   const {
-    shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
-    atrPeriod = 14, atrMultiplier = 1.5, riskReward = 1,
+    shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
+    atrPeriod = 14, atrMultiplier = 2, riskReward = 1.5,
     volumePeriod = 20, volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
-    erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 2,
+    erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
   } = opts;
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
@@ -315,11 +315,11 @@ export function generateSignal(prices, opts = {}, volumes = null) {
 //    단순 배율로 곱해지므로(강제청산 위험은 별도 고려 필요) leverage로 적용한다.
 export function backtest(prices, opts = {}, volumes = null) {
   const {
-    shortPeriod = 12, longPeriod = 26, rsiPeriod = 14, zigzagPct = 0.05,
+    shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
     useStopLoss = true, useTarget = true,
     atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
-    trailMultiplier = 2, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
+    trailMultiplier = 1.5, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
   } = opts;
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
