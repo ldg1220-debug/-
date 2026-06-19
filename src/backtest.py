@@ -213,7 +213,13 @@ def _is_volume_spike(candles_window: List[Candle]) -> bool:
 
 
 def _sharpe(returns: List[float]) -> float:
-    """Annualised Sharpe ratio from per-candle returns (assumes 1-min candles)."""
+    """Annualised Sharpe ratio from per-candle log returns (assumes 1-min candles).
+
+    Simple percentage returns ((eq[j]-eq[j-1])/eq[j-1]) are not used here: their
+    arithmetic mean is biased upward by compounding asymmetry (e.g. -10% then
+    +11.1% returns capital to par, but the arithmetic mean of those two simple
+    returns is +0.55%, not 0). Log returns avoid this bias.
+    """
     n = len(returns)
     if n < 2:
         return 0.0
@@ -429,11 +435,13 @@ class BacktestEngine:
         win_rate = wins / len(trades) if trades else 0.0
         total_pnl = sum(t["pnl"] for t in trades)
 
-        # Per-candle returns for Sharpe
+        # Per-candle log returns for Sharpe (see _sharpe() docstring for why log,
+        # not simple, returns are required to avoid an upward bias)
         returns = []
         for j in range(1, len(equity_curve)):
             prev = equity_curve[j - 1]
-            returns.append((equity_curve[j] - prev) / prev if prev else 0.0)
+            curr = equity_curve[j]
+            returns.append(math.log(curr / prev) if prev > 0 and curr > 0 else 0.0)
 
         sharpe = _sharpe(returns)
         max_dd = _max_drawdown(equity_curve)
