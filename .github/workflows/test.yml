@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff --quiet
+          ruff check src/ tests/ main.py || true
+
+      - name: Run unit tests
+        env:
+          PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+          EDGEX_API_URL: "https://testnet-api.edgex.exchange"
+          BINANCE_TESTNET: "true"
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Backtest smoke test
+        env:
+          BINANCE_TESTNET: "true"
+        run: python -c "from src.backtest import BacktestEngine, BacktestResult; print('backtest import OK')"
+
+      - name: State/Risk manager smoke test
+        run: python -c "from src.state_manager import StateManager; from src.risk_manager import RiskManager; print('state+risk import OK')"

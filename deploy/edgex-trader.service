@@ -1,0 +1,46 @@
+# /etc/systemd/system/edgex-trader.service
+# 설치: sudo cp deploy/edgex-trader.service /etc/systemd/system/
+#        sudo systemctl daemon-reload && sudo systemctl enable edgex-trader
+
+[Unit]
+Description=edgeX Hybrid Trading Bot (Docker Compose)
+Documentation=https://github.com/your-org/edgex-trader
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/edgex-trader
+
+# 환경 변수 파일 (API 키 포함 — 권한 600 필수)
+EnvironmentFile=/opt/edgex-trader/.env
+
+# ── 실전 모드 (아래 ExecStart 활성화) ──────────────────────────────
+ExecStart=/usr/bin/docker-compose up --no-color trader
+
+# ── 드라이런 모드 (위 줄 주석 처리 후 아래 줄 활성화) ───────────────
+# ExecStart=/usr/bin/docker-compose --profile dryrun up --no-color trader_dryrun
+
+ExecStop=/usr/bin/docker-compose down --remove-orphans
+
+# 컨테이너 강제 종료 전 최대 대기 시간 (단위: 초)
+TimeoutStopSec=60
+
+# 실패 시 자동 재시작 (30초 후)
+Restart=on-failure
+RestartSec=30
+
+# 로그 파일 (journald와 병행)
+StandardOutput=append:/opt/edgex-trader/logs/trader.log
+StandardError=append:/opt/edgex-trader/logs/trader-error.log
+
+# 자원 제한
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
