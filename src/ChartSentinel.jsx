@@ -51,6 +51,78 @@ const isCrypto = (ticker) => {
   return CRYPTO_SYMBOLS.has(base);
 };
 
+// 크립토 심볼 → CoinGecko 코인 ID (Binance 접근 제한 시 폴백으로 사용)
+const COINGECKO_ID_MAP = {
+  BTC: "bitcoin", ETH: "ethereum", XRP: "ripple", SOL: "solana",
+  BNB: "binancecoin", ADA: "cardano", DOGE: "dogecoin", AVAX: "avalanche-2",
+  DOT: "polkadot", LINK: "chainlink", MATIC: "matic-network", TRX: "tron",
+  LTC: "litecoin", SHIB: "shiba-inu", SUI: "sui",
+};
+
+// CoinGecko market_chart API에서 일별 가격을 가져와 캔버스에 라인 차트로 렌더링하고
+// base64 PNG로 반환한다 (Vision 분석에 이미지로 투입하기 위함).
+async function fetchCoinGeckoChartImage(resolvedTicker, days = 30) {
+  const symbol = resolvedTicker.toUpperCase().split("-")[0];
+  const coinId = COINGECKO_ID_MAP[symbol];
+  if (!coinId) throw new Error(`CoinGecko 매핑 없음: ${symbol}`);
+
+  const res = await fetch(
+    `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`
+  );
+  if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+  const data = await res.json();
+  const prices = data.prices || []; // [[timestamp, price], ...]
+  if (prices.length < 2) throw new Error("가격 데이터가 부족합니다.");
+
+  const W = 800, H = 400, PAD = 40;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = "#04070f";
+  ctx.fillRect(0, 0, W, H);
+
+  const values = prices.map((p) => p[1]);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  const x = (i) => PAD + (i / (prices.length - 1)) * (W - PAD * 2);
+  const y = (v) => H - PAD - ((v - min) / range) * (H - PAD * 2);
+
+  // 그리드
+  ctx.strokeStyle = "#0d1f3c";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const gy = PAD + (i / 4) * (H - PAD * 2);
+    ctx.beginPath();
+    ctx.moveTo(PAD, gy);
+    ctx.lineTo(W - PAD, gy);
+    ctx.stroke();
+  }
+
+  // 가격선
+  ctx.strokeStyle = "#38d4c8";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  prices.forEach((p, i) => {
+    const px = x(i), py = y(p[1]);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+
+  // 레이블
+  ctx.fillStyle = "#566a85";
+  ctx.font = "12px monospace";
+  ctx.fillText(`${symbol}/USD · ${days}D · CoinGecko`, PAD, 20);
+  ctx.fillText(`High: $${max.toLocaleString()}`, PAD, H - 8);
+  ctx.fillText(`Low: $${min.toLocaleString()}`, W - PAD - 140, H - 8);
+
+  return canvas.toDataURL("image/png").split(",")[1]; // base64 only
+}
+
 function buildSystemPrompt(assetType) {
   const base = `당신은 Goldman Sachs & Paradigm Capital 출신의 시니어 퀀트 애널리스트입니다.
 차트 이미지와 종목 정보를 바탕으로 심층 분석 리포트를 작성합니다.
@@ -289,7 +361,27 @@ export default function ChartSentinel() {
   const [report, setReport] = useState(null);
   const [logs, setLogs] = useState([]);
   const [error, setError] = useState(null);
+  const [fetchingChart, setFetchingChart] = useState(false);
   const fileRef = useRef(null);
+
+  const key = tickerInput.trim();
+  const resolvedTicker = TICKER_MAP[key] || TICKER_MAP[key.toUpperCase()] || key.toUpperCase();
+  const tickerIsCrypto = isCrypto(resolvedTicker);
+
+  const autoFetchChart = async () => {
+    setFetchingChart(true);
+    setError(null);
+    try {
+      const b64 = await fetchCoinGeckoChartImage(resolvedTicker);
+      setImage(`data:image/png;base64,${b64}`);
+      setImageB64(b64);
+      setImageMime("image/png");
+    } catch (e) {
+      setError("차트 자동 불러오기 실패: " + e.message);
+    } finally {
+      setFetchingChart(false);
+    }
+  };
 
   // 이미지 미리보기 URL 메모리 누수 방지
   useEffect(() => {
@@ -326,8 +418,7 @@ export default function ChartSentinel() {
     setError(null);
     setReport(null);
 
-    const key = tickerInput.trim();
-    const resolved = TICKER_MAP[key] || TICKER_MAP[key.toUpperCase()] || key.toUpperCase();
+    const resolved = resolvedTicker;
     const assetType = isCrypto(resolved) ? "crypto" : "stock";
     const sys = buildSystemPrompt(assetType);
 
@@ -426,15 +517,27 @@ export default function ChartSentinel() {
                 )}
                 <input ref={fileRef} type="file" hidden accept="image/*" onChange={(e) => onFile(e.target.files[0])} />
               </div>
-              {image && (
-                <button
-                  type="button"
-                  onClick={clearImage}
-                  style={{ background: "none", border: "1px solid #1a2d4a", color: "#566a85", padding: "4px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "11px", marginTop: "8px", fontFamily: "inherit" }}
-                >
-                  이미지 제거
-                </button>
-              )}
+              <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                {image && (
+                  <button
+                    type="button"
+                    onClick={clearImage}
+                    style={{ background: "none", border: "1px solid #1a2d4a", color: "#566a85", padding: "4px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "11px", fontFamily: "inherit" }}
+                  >
+                    이미지 제거
+                  </button>
+                )}
+                {tickerIsCrypto && (
+                  <button
+                    type="button"
+                    onClick={autoFetchChart}
+                    disabled={fetchingChart}
+                    style={{ background: "none", border: "1px solid #38d4c840", color: "#38d4c8", padding: "4px 12px", borderRadius: "4px", cursor: fetchingChart ? "not-allowed" : "pointer", fontSize: "11px", fontFamily: "inherit", opacity: fetchingChart ? 0.6 : 1 }}
+                  >
+                    {fetchingChart ? "불러오는 중..." : "◈ 차트 자동 불러오기 (CoinGecko)"}
+                  </button>
+                )}
+              </div>
             </div>
 
             {error && <div style={{ ...S.card, borderColor: "#ff506440", color: "#ff8090", fontSize: "13px" }}>⚠ {error}</div>}
