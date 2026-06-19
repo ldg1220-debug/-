@@ -29,6 +29,30 @@ export function ema(values, period) {
   return out;
 }
 
+// ATR (Average True Range) 근사치 — 일/시간봉 종가만 있는 경우 종가간 변동폭을
+// True Range로 사용한다 (실제 OHLC 고저폭보다는 보수적으로 작게 잡힐 수 있음).
+export function atr(values, period = 14) {
+  const tr = values.map((v, i) => (i === 0 ? 0 : Math.abs(v - values[i - 1])));
+  const out = new Array(values.length).fill(null);
+  if (values.length <= period) return out;
+  let avg = tr.slice(1, period + 1).reduce((a, b) => a + b, 0) / period;
+  out[period] = avg;
+  for (let i = period + 1; i < values.length; i++) {
+    avg = (avg * (period - 1) + tr[i]) / period;
+    out[i] = avg;
+  }
+  return out;
+}
+
+// 거래량 확인: 현재 거래량이 평균 대비 기준치 이상이면 신호에 신뢰도를 더한다.
+export function volumeConfirmed(volumes, period = 20, multiplier = 1.2) {
+  if (!volumes || volumes.length <= period) return null;
+  const avg = sma(volumes, period);
+  const last = volumes.length - 1;
+  if (avg[last] == null) return null;
+  return volumes[last] > avg[last] * multiplier;
+}
+
 // Wilder's RSI
 export function rsi(values, period = 14) {
   const out = new Array(values.length).fill(null);
@@ -117,8 +141,12 @@ export function elliottWaveHint(pivots) {
 }
 
 // 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
-export function generateSignal(prices, opts = {}) {
-  const { shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05 } = opts;
+export function generateSignal(prices, opts = {}, volumes = null) {
+  const {
+    shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05,
+    atrPeriod = 14, atrMultiplier = 1.5, riskReward = 2,
+    volumePeriod = 20, volumeMultiplier = 1.2,
+  } = opts;
   if (prices.length < longPeriod + 2) {
     throw new Error(`신호 계산에 최소 ${longPeriod + 2}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
   }
@@ -126,6 +154,7 @@ export function generateSignal(prices, opts = {}) {
   const emaShort = ema(prices, shortPeriod);
   const emaLong = ema(prices, longPeriod);
   const rsiSeries = rsi(prices, rsiPeriod);
+  const atrSeries = atr(prices, atrPeriod);
   const pivots = zigzag(prices, zigzagPct);
   const wave = elliottWaveHint(pivots);
 
@@ -177,21 +206,34 @@ export function generateSignal(prices, opts = {}) {
   if (nearFibSupport) { score += 1; reasons.push("피보나치 지지선 근접"); }
   if (nearFibResistance) { score -= 1; reasons.push("피보나치 저항선 근접"); }
 
+  const volConfirmed = volumeConfirmed(volumes, volumePeriod, volumeMultiplier);
+  if (volConfirmed === true) {
+    if (score > 0) { score += 1; reasons.push("거래량 동반 (신호 확인)"); }
+    else if (score < 0) { score -= 1; reasons.push("거래량 동반 (신호 확인)"); }
+  } else if (volConfirmed === false && score !== 0) {
+    score = score > 0 ? score - 1 : score + 1;
+    reasons.push("거래량 부족 (신호 신뢰도 하향)");
+  }
+
   let position = "관망";
   if (score >= 2) position = "매수";
   else if (score <= -2) position = "매도";
 
-  const swingLow = pivots.length ? Math.min(...pivots.slice(-3).map((p) => p.price)) : curPrice * 0.95;
-  const swingHigh = pivots.length ? Math.max(...pivots.slice(-3).map((p) => p.price)) : curPrice * 1.05;
-
-  const stopLoss = position === "매수" ? swingLow : position === "매도" ? swingHigh : null;
-  const target = fib
-    ? [fib.extension[1.272], fib.extension[1.618]]
+  // ATR 기반 동적 손절/목표가: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
+  const curAtr = atrSeries[last];
+  const riskDistance = curAtr != null ? curAtr * atrMultiplier : curPrice * 0.02;
+  const stopLoss = position === "매수" ? curPrice - riskDistance
+    : position === "매도" ? curPrice + riskDistance
+    : null;
+  const target = position === "매수"
+    ? [curPrice + riskDistance * riskReward, curPrice + riskDistance * riskReward * 1.5]
+    : position === "매도"
+    ? [curPrice - riskDistance * riskReward, curPrice - riskDistance * riskReward * 1.5]
     : null;
 
   return {
     position,
-    confidence: Math.min(10, Math.abs(score) * 3 + 1),
+    confidence: Math.min(10, Math.abs(score) * 2 + 1),
     entry: curPrice,
     stopLoss,
     target,
@@ -201,24 +243,27 @@ export function generateSignal(prices, opts = {}) {
       emaShort: curEmaShort,
       emaLong: curEmaLong,
       rsi: curRsi,
+      atr: curAtr,
       trend: trendUp ? "상승" : "하락",
       goldenCross,
       deadCross,
       fibonacci: fib,
       elliott: wave,
+      volumeConfirmed: volConfirmed,
     },
   };
 }
 
-// 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치) 시 청산.
-// 손절가를 실제로 체결에 반영해야 룰의 리스크관리 효과를 검증할 수 있다.
-export function backtest(prices, opts = {}) {
-  const { shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05, useStopLoss = true } = opts;
+// 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치 | 목표가 터치) 시 청산.
+// 손절/목표가를 실제로 체결에 반영해야 ATR 기반 리스크관리 효과를 검증할 수 있다.
+export function backtest(prices, opts = {}, volumes = null) {
+  const { shortPeriod = 20, longPeriod = 50, rsiPeriod = 14, zigzagPct = 0.05, useStopLoss = true, useTarget = true } = opts;
   const minBars = longPeriod + 2;
   const trades = [];
   let holding = false;
   let entryPrice = null;
   let activeStop = null;
+  let activeTarget = null;
   let lastPosition = "관망";
 
   for (let i = minBars; i < prices.length; i++) {
@@ -227,13 +272,23 @@ export function backtest(prices, opts = {}) {
       holding = false;
       entryPrice = null;
       activeStop = null;
+      activeTarget = null;
+      continue;
+    }
+    if (holding && useTarget && activeTarget != null && prices[i] >= activeTarget) {
+      trades.push({ entryPrice, exitPrice: activeTarget, returnPct: (activeTarget - entryPrice) / entryPrice * 100, exitReason: "take_profit" });
+      holding = false;
+      entryPrice = null;
+      activeStop = null;
+      activeTarget = null;
       continue;
     }
 
     const window = prices.slice(0, i + 1);
+    const volWindow = volumes ? volumes.slice(0, i + 1) : null;
     let sig;
     try {
-      sig = generateSignal(window, { shortPeriod, longPeriod, rsiPeriod, zigzagPct });
+      sig = generateSignal(window, { shortPeriod, longPeriod, rsiPeriod, zigzagPct }, volWindow);
     } catch {
       continue;
     }
@@ -242,12 +297,14 @@ export function backtest(prices, opts = {}) {
       holding = true;
       entryPrice = prices[i];
       activeStop = sig.stopLoss;
+      activeTarget = sig.target ? sig.target[0] : null;
     } else if (holding && sig.position === "매도") {
       const exitPrice = prices[i];
       trades.push({ entryPrice, exitPrice, returnPct: (exitPrice - entryPrice) / entryPrice * 100, exitReason: "signal_flip" });
       holding = false;
       entryPrice = null;
       activeStop = null;
+      activeTarget = null;
     }
     lastPosition = sig.position;
   }
