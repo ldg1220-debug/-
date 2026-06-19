@@ -163,6 +163,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     volumePeriod = 20, volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
     erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
+    breakoutLookback = 20,
   } = opts;
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
@@ -259,6 +260,22 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   if (score >= scoreThreshold) position = "매수";
   else if (score <= -scoreThreshold) position = "매도";
 
+  // 추세추종 진입 보강: EMA 골든/데드크로스만으로는 추세가 이미 꺾이기 시작한
+  // 끝물에 들어가 트레일링 스탑에 바로 걸리는 경우가 대부분이었다(실측: 19건 중
+  // 17건이 진입 직후 -1~-4% 손절). ER이 "상승 중"이고(추세 강도가 막 붙는 구간)
+  // 가격이 최근 N봉 신고가/신저가를 "돌파"한 시점으로 진입을 좁혀 늦은 진입을 줄인다.
+  if (regime === "추세" && position !== "관망") {
+    const lookbackPrices = prices.slice(Math.max(0, last - breakoutLookback), last);
+    const erRising = curEr != null && erSeries[last - 1] != null && curEr > erSeries[last - 1];
+    const breakoutConfirmed = position === "매수"
+      ? curPrice > Math.max(...lookbackPrices)
+      : curPrice < Math.min(...lookbackPrices);
+    if (!(erRising && breakoutConfirmed)) {
+      reasons.push("추세 진입 보류: ER 상승 또는 신고가/신저가 돌파 미확인");
+      position = "관망";
+    }
+  }
+
   // ATR 기반 동적 손절/목표가: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
   const curAtr = atrSeries[last];
   const riskDistance = curAtr != null ? curAtr * atrMultiplier : curPrice * 0.02;
@@ -320,6 +337,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
+    breakoutLookback,
   } = opts;
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -370,6 +388,7 @@ export function backtest(prices, opts = {}, volumes = null) {
         shortPeriod, longPeriod, rsiPeriod, zigzagPct,
         atrPeriod, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
         volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold, trailMultiplier,
+        breakoutLookback,
       }, volWindow);
     } catch {
       continue;
