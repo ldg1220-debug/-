@@ -28,6 +28,13 @@ VOLUME_MA_WINDOW: int = 20          # mirrors VOLUME_MA_MINUTES in data_fetcher
 TRAILING_STOP_PCT: float = 0.02
 STOP_LOSS_PCT: float = 0.015
 
+# Trading fees: box limit orders rest on the book (maker), breakout entries and
+# stop/trailing exits are market orders (taker). Without these, repeated box
+# round-trips inside a static lookback window compound into fictitious profit
+# (verified: realistic candles, no fees → +3.2e8 USDT over 3000 candles).
+MAKER_FEE_PCT: float = float(os.getenv("MAKER_FEE_PCT", "0.0002"))   # 0.02%
+TAKER_FEE_PCT: float = float(os.getenv("TAKER_FEE_PCT", "0.0005"))   # 0.05%
+
 BINANCE_TESTNET: bool = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
 BINANCE_BASE: str = (
     "https://testnet.binance.vision/api/v3"
@@ -308,11 +315,12 @@ class BacktestEngine:
                 filled, fill_price = self._try_fill_limit(order, candle)
                 if filled:
                     if order["side"] == "BUY":
-                        # Enter long position
+                        # Enter long position (limit fill = maker)
                         size = order["size"]
                         cost = fill_price * size
-                        if cost <= free_capital:
-                            free_capital -= cost
+                        entry_fee = cost * MAKER_FEE_PCT
+                        if cost + entry_fee <= free_capital:
+                            free_capital -= cost + entry_fee
                             position = {
                                 "side": "BUY",
                                 "entry_price": fill_price,
@@ -322,9 +330,10 @@ class BacktestEngine:
                             }
                             filled_orders.append(order)
                     elif order["side"] == "SELL" and position is not None:
-                        # Close long via box sell limit
+                        # Close long via box sell limit (maker)
                         pnl, free_capital = self._close_position(
-                            position, fill_price, free_capital, candle.open_time, trades
+                            position, fill_price, free_capital, candle.open_time, trades,
+                            fee_rate=MAKER_FEE_PCT,
                         )
                         total_capital += pnl
                         position = None
@@ -359,7 +368,8 @@ class BacktestEngine:
                         exit_price = pk * (1 - TRAILING_STOP_PCT) if position["side"] == "BUY" else pk * (1 + TRAILING_STOP_PCT)
 
                     pnl, free_capital = self._close_position(
-                        position, exit_price, free_capital, candle.open_time, trades
+                        position, exit_price, free_capital, candle.open_time, trades,
+                        fee_rate=TAKER_FEE_PCT,
                     )
                     total_capital += pnl
                     position = None
@@ -380,10 +390,12 @@ class BacktestEngine:
                 # Enter market-like order (fill at close)
                 if position is None and len(window) >= 2:
                     side = "BUY" if price > window[-2].close else "SELL"
-                    size = free_capital / price if price > 0 else 0.0
+                    # Reserve room for the taker entry fee within free_capital
+                    size = free_capital / (price * (1 + TAKER_FEE_PCT)) if price > 0 else 0.0
                     if size > 0:
                         cost = price * size
-                        free_capital -= cost
+                        entry_fee = cost * TAKER_FEE_PCT
+                        free_capital -= cost + entry_fee
                         position = {
                             "side": side,
                             "entry_price": price,
@@ -426,7 +438,8 @@ class BacktestEngine:
             last_price = candles[-1].close
             last_time = candles[-1].open_time
             pnl, free_capital = self._close_position(
-                position, last_price, free_capital, last_time, trades
+                position, last_price, free_capital, last_time, trades,
+                fee_rate=TAKER_FEE_PCT,
             )
             total_capital += pnl
 
@@ -482,18 +495,26 @@ class BacktestEngine:
         free_capital: float,
         close_time: int,
         trades: List[dict],
+        fee_rate: float = 0.0,
     ):
-        """Close position, record trade, return (pnl, updated_free_capital)."""
+        """Close position, record trade, return (pnl, updated_free_capital).
+
+        `fee_rate` is charged on the exit notional only — the entry fee is
+        already deducted from free_capital at order-fill time.
+        """
         ep = position["entry_price"]
         sz = position["size"]
         side = position["side"]
 
         if side == "BUY":
-            pnl = (exit_price - ep) * sz
+            gross_pnl = (exit_price - ep) * sz
         else:
-            pnl = (ep - exit_price) * sz
+            gross_pnl = (ep - exit_price) * sz
 
-        # Return cost basis + pnl to free capital
+        exit_fee = exit_price * sz * fee_rate
+        pnl = gross_pnl - exit_fee
+
+        # Return cost basis + pnl (net of exit fee) to free capital
         free_capital += ep * sz + pnl
 
         trades.append(
@@ -504,6 +525,7 @@ class BacktestEngine:
                 "entry": ep,
                 "exit": exit_price,
                 "size": sz,
+                "fee": exit_fee,
                 "pnl": pnl,
             }
         )
