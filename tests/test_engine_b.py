@@ -389,14 +389,55 @@ class TestHedgePositionFields(unittest.TestCase):
         self.assertLessEqual(engine.position.entry_time, after)
 
     def test_entry_basis_set_after_enter(self):
-        """enter_hedge_async 후 entry_basis가 설정됨."""
+        """enter_hedge_async 후 entry_basis가 설정됨 (양쪽 모두 동일 가격으로 진입하므로 0)."""
         engine = make_engine(dry_run=True)
         asyncio.run(engine.enter_hedge_async("BTC-USDC", 50_000.0, 0.1))
-        # dry_run에서 binance entry = 0 (fills[0].price = "0")
-        # entry_basis가 계산되거나 0이어야 함 (binance_long_entry = 0이면 스킵)
-        # dry_run이면 fills=[{"price": "0"}] → avg=0 → binance_long_entry=0
-        # entry_basis 계산 스킵됨 (binance_long_entry == 0)
         self.assertEqual(engine.position.entry_basis, 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# dry-run 모드 binance_long_entry 회귀 테스트
+# (이전 버그: _open_binance_long_async가 dry-run에서 price="0"을 반환해
+#  binance_long_entry가 항상 0이 되어 PnL/entry_basis 계산이 완전히 깨짐)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDryRunBinanceEntryPrice(unittest.TestCase):
+
+    def test_binance_long_entry_uses_actual_price_not_zero(self):
+        """dry-run에서도 binance_long_entry가 실제 진입가로 설정되어야 한다."""
+        engine = make_engine(dry_run=True)
+        asyncio.run(engine.enter_hedge_async("BTC-USDC", 50_000.0, 0.1))
+        self.assertAlmostEqual(engine.position.binance_long_entry, 50_000.0)
+
+    def test_unrealized_pnl_is_near_zero_when_price_unchanged(self):
+        """진입가와 동일한 가격에서는 헤지 PnL이 0에 가까워야 한다 (델타 뉴트럴)."""
+        engine = make_engine(dry_run=True)
+        asyncio.run(engine.enter_hedge_async("BTC-USDC", 50_000.0, 0.1))
+        upnl = engine._calculate_unrealized_pnl(50_000.0)
+        self.assertAlmostEqual(upnl, 0.0)
+
+    def test_unrealized_pnl_cancels_out_after_price_move(self):
+        """가격이 변동해도 숏+롱 합산 PnL은 0에 가까워야 한다 (방향성 리스크 없음)."""
+        engine = make_engine(dry_run=True)
+        asyncio.run(engine.enter_hedge_async("BTC-USDC", 50_000.0, 0.1))
+        upnl = engine._calculate_unrealized_pnl(48_000.0)  # 4% 하락
+        self.assertAlmostEqual(upnl, 0.0, places=6)
+
+    def test_rebalance_passes_market_price_to_binance_open(self):
+        """rebalance()가 _open_binance_long_async에 실제 시세를 전달해야 한다."""
+        engine = make_engine(dry_run=True)
+        engine.position.edgex_short_size = 1.0
+        engine.position.binance_long_size = 0.8  # 델타 불일치 → 리밸런스 필요
+        engine.position.last_rebalance_time = 0.0
+        market = make_market(price=55_000.0)
+        with patch.object(
+            engine, "_open_binance_long_async", new=AsyncMock(return_value=None)
+        ) as mock_open:
+            asyncio.run(engine.rebalance(market))
+        mock_open.assert_called_once()
+        args, kwargs = mock_open.call_args
+        called_price = args[2] if len(args) > 2 else kwargs.get("price")
+        self.assertAlmostEqual(called_price, 55_000.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

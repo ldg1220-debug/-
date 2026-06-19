@@ -126,11 +126,11 @@ class EngineB:
     # --- Binance spot long (async) ---
 
     async def _open_binance_long_async(
-        self, binance_symbol: str, size: float
+        self, binance_symbol: str, size: float, price: float = 0.0
     ) -> dict | None:
         if self.dry_run:
-            logger.info("[DRY-RUN] Binance 롱: %s %.6f", binance_symbol, size)
-            return {"orderId": f"DRY-LONG-{binance_symbol}", "fills": [{"price": "0"}]}
+            logger.info("[DRY-RUN] Binance 롱: %s %.6f @ %.2f", binance_symbol, size, price)
+            return {"orderId": f"DRY-LONG-{binance_symbol}", "fills": [{"price": str(price)}]}
 
         import hashlib
         import hmac
@@ -253,7 +253,7 @@ class EngineB:
         self.symbol = symbol
 
         edgex_task = self._open_edgex_short_async(symbol, price, size)
-        binance_task = self._open_binance_long_async(binance_symbol, size)
+        binance_task = self._open_binance_long_async(binance_symbol, size, price)
 
         edgex_result, binance_result = await asyncio.gather(
             edgex_task, binance_task, return_exceptions=True
@@ -329,7 +329,7 @@ class EngineB:
             return
         if diff > 0:
             binance_sym = self.symbol.replace("-USDC", "USDT")
-            await self._open_binance_long_async(binance_sym, diff)
+            await self._open_binance_long_async(binance_sym, diff, market.last_price)
         else:
             await self._open_edgex_short_async(self.symbol, market.last_price, -diff)
         self.position.last_rebalance_time = now
