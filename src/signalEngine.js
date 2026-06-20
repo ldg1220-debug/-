@@ -167,7 +167,13 @@ export function elliottWaveHint(pivots) {
 // 일봉보다 짧은 타임프레임(4시간/30분/5분)에서도 추세추종이 통하는지 edgeX
 // 실데이터로 검증한 결과(4시간=180일/30분=60일/5분=21일치, 20종목, 실수수료
 // 반영): 모두 양의 누적수익을 냈고 기간이 짧을수록 거래빈도가 크게 늘어
-// (4h n=209 -> 30m n=576 -> 5m n=1566, 21일 기준) 단타용 추세추종 옵션으로 추가.
+// (4h n=209 -> 30m n=445 -> 5m n=1566) 단타용 추세추종 옵션으로 추가.
+// 이후 더 넓은 그리드(144개 조합)로 재검증: 4h/5m는 기존 값이 이미 상위권이라
+// 유지, 30분봉은 breakoutLookback=30/trailMultiplier=3/trendAtrMultiplier=2.5가
+// 더 우수해(exclTop 97.17%->125.24%) 교체. 단, 일봉 결과는 전반부 거래(특히
+// XRP 1건 +313.6%p)에 총수익의 절반 이상이 쏠려 있고 전후반 기간을 나누면
+// 후반부는 오히려 -24.28%로 단일 구간/단일거래 의존도가 커서 과신은 금물.
+// 5분봉도 전반부 +7.96% vs 후반부 +57.87%로 기간별 편차가 크다.
 const TIMEFRAME_PRESETS = {
   daily: {
     shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
@@ -185,8 +191,8 @@ const TIMEFRAME_PRESETS = {
   },
   thirtyMin: {
     shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
-    erTrendThreshold: 0.2, breakoutLookback: 20,
-    trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 2.5,
+    erTrendThreshold: 0.2, breakoutLookback: 30,
+    trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3,
   },
   fiveMin: {
     shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
