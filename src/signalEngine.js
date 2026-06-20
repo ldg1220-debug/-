@@ -174,11 +174,16 @@ export function elliottWaveHint(pivots) {
 // XRP 1건 +313.6%p)에 총수익의 절반 이상이 쏠려 있고 전후반 기간을 나누면
 // 후반부는 오히려 -24.28%로 단일 구간/단일거래 의존도가 커서 과신은 금물.
 // 5분봉도 전반부 +7.96% vs 후반부 +57.87%로 기간별 편차가 크다.
+// 일봉은 추세 진입 시 ER상승+신고가/신저가 돌파(breakoutLookback=20)까지
+// 요구해 표본이 너무 적었다(30종목 합산 n=94, 후반부 -46.65%로 손실 전환).
+// breakoutLookback=5/trendScoreThreshold=1/erTrendThreshold=0.1/trailMultiplier=2로
+// 진입 문턱을 낮추자 거래수가 94->198건으로 늘면서 후반부도 -46.65%->+49.90%로
+// 손실에서 양전환됐고 견고성(exclTop3, 상위3거래 제외 수익)도 86%->351%로 개선돼 채택.
 const TIMEFRAME_PRESETS = {
   daily: {
     shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
-    scoreThreshold: 3, erTrendThreshold: 0.2, breakoutLookback: 20,
-    trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 2.5,
+    scoreThreshold: 3, erTrendThreshold: 0.1, breakoutLookback: 5,
+    trendScoreThreshold: 1, trendAtrMultiplier: 1.5, trailMultiplier: 2,
   },
   hourly: {
     shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
