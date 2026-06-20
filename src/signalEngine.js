@@ -378,21 +378,23 @@ export function backtest(prices, opts = {}, volumes = null) {
   let entryRegime = null;
   let highestSinceEntry = null;
   let lastPosition = "관망";
+  let entryIndex = null;
 
   const atrSeries = atr(prices, atrPeriod);
 
-  const closeTrade = (exitPrice, exitReason) => {
+  const closeTrade = (exitPrice, exitReason, exitIndex) => {
     const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
     const exitFeePct = exitReason === "take_profit" ? makerFeePct : takerFeePct;
     const feePct = takerFeePct + exitFeePct; // 진입(테이커) + 청산(주문유형별)
     const returnPct = grossPct - feePct;
-    trades.push({ entryPrice, exitPrice, returnPct, exitReason, regime: entryRegime, feePct });
+    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: entryRegime, feePct });
     holding = false;
     entryPrice = null;
     activeStop = null;
     activeTarget = null;
     entryRegime = null;
     highestSinceEntry = null;
+    entryIndex = null;
   };
 
   for (let i = minBars; i < prices.length; i++) {
@@ -402,11 +404,11 @@ export function backtest(prices, opts = {}, volumes = null) {
       if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
     }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
-      closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss");
+      closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss", i);
       continue;
     }
     if (holding && useTarget && activeTarget != null && prices[i] >= activeTarget) {
-      closeTrade(activeTarget, "take_profit");
+      closeTrade(activeTarget, "take_profit", i);
       continue;
     }
 
@@ -427,18 +429,19 @@ export function backtest(prices, opts = {}, volumes = null) {
     if (!holding && sig.position === "매수") {
       holding = true;
       entryPrice = prices[i];
+      entryIndex = i;
       entryRegime = sig.indicators.regime;
       activeStop = sig.stopLoss;
       activeTarget = entryRegime === "추세" ? null : (sig.target ? sig.target[0] : null);
       highestSinceEntry = entryRegime === "추세" ? prices[i] : null;
     } else if (holding && sig.position === "매도") {
-      closeTrade(prices[i], "signal_flip");
+      closeTrade(prices[i], "signal_flip", i);
     }
     lastPosition = sig.position;
   }
 
   if (holding) {
-    closeTrade(prices[prices.length - 1], "open_at_end");
+    closeTrade(prices[prices.length - 1], "open_at_end", prices.length - 1);
   }
 
   const wins = trades.filter((t) => t.returnPct > 0).length;
