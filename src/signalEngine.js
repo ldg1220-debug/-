@@ -164,6 +164,10 @@ export function elliottWaveHint(pivots) {
 // 살아남은 거래도 청산 후 평균 수십%p의 추가 상승을 놓치는 문제가 실측됐다
 // (예: UNI 청산후 +46.2%p, XRP +117.6%p 추가 상승). trailMultiplier=2.5로 넓히면
 // 조기 손절 비율이 60.7%->48%로 줄고 총수익도 +327%->+546%로 늘어 채택.
+// 일봉보다 짧은 타임프레임(4시간/30분/5분)에서도 추세추종이 통하는지 edgeX
+// 실데이터로 검증한 결과(4시간=180일/30분=60일/5분=21일치, 20종목, 실수수료
+// 반영): 모두 양의 누적수익을 냈고 기간이 짧을수록 거래빈도가 크게 늘어
+// (4h n=209 -> 30m n=576 -> 5m n=1566, 21일 기준) 단타용 추세추종 옵션으로 추가.
 const TIMEFRAME_PRESETS = {
   daily: {
     shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
@@ -173,6 +177,21 @@ const TIMEFRAME_PRESETS = {
   hourly: {
     shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
     scoreThreshold: 3, erTrendThreshold: 0.7,
+  },
+  fourHour: {
+    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    erTrendThreshold: 0.2, breakoutLookback: 20,
+    trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 1.5,
+  },
+  thirtyMin: {
+    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    erTrendThreshold: 0.2, breakoutLookback: 20,
+    trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 2.5,
+  },
+  fiveMin: {
+    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    erTrendThreshold: 0.2, breakoutLookback: 20,
+    trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
   },
 };
 
