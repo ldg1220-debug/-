@@ -158,13 +158,17 @@ export function elliottWaveHint(pivots) {
 // 타임프레임별 검증된 파라미터 프리셋. 일봉과 시간봉은 변동성/신호 빈도가 달라
 // 같은 파라미터를 쓰면 한쪽이 무너진다(실측: 일봉 튠 파라미터를 시간봉에 그대로
 // 쓰면 승률이 47.7%로 하락). opts에 명시된 값은 프리셋을 덮어쓴다.
-// 아래 값은 edgeX v1 실거래소 데이터(11종목, 일봉 최대 700봉/시간봉 91일)에
+// 아래 값은 edgeX v1 실거래소 데이터(20종목, 일봉 최대 700봉/시간봉 91일)에
 // 실제 수수료(taker 0.038%/maker 0.018%)를 반영해 그리드서치로 재검증한 결과다.
+// trailMultiplier=1.5는 추세 거래의 60%가 3일 이내 트레일링 스탑에 털리고(승률 13%),
+// 살아남은 거래도 청산 후 평균 수십%p의 추가 상승을 놓치는 문제가 실측됐다
+// (예: UNI 청산후 +46.2%p, XRP +117.6%p 추가 상승). trailMultiplier=2.5로 넓히면
+// 조기 손절 비율이 60.7%->48%로 줄고 총수익도 +327%->+546%로 늘어 채택.
 const TIMEFRAME_PRESETS = {
   daily: {
     shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
     scoreThreshold: 3, erTrendThreshold: 0.2, breakoutLookback: 20,
-    trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
+    trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 2.5,
   },
   hourly: {
     shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
