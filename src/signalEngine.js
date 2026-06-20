@@ -158,11 +158,13 @@ export function elliottWaveHint(pivots) {
 // 타임프레임별 검증된 파라미터 프리셋. 일봉과 시간봉은 변동성/신호 빈도가 달라
 // 같은 파라미터를 쓰면 한쪽이 무너진다(실측: 일봉 튠 파라미터를 시간봉에 그대로
 // 쓰면 승률이 47.7%로 하락). opts에 명시된 값은 프리셋을 덮어쓴다.
+// 아래 값은 edgeX v1 실거래소 데이터(11종목, 일봉 최대 700봉/시간봉 91일)에
+// 실제 수수료(taker 0.038%/maker 0.018%)를 반영해 그리드서치로 재검증한 결과다.
 const TIMEFRAME_PRESETS = {
   daily: {
-    shortPeriod: 8, longPeriod: 21, atrMultiplier: 2, riskReward: 0.8,
-    scoreThreshold: 3, erTrendThreshold: 0.3, breakoutLookback: 50,
-    trendScoreThreshold: 2, trendAtrMultiplier: 2.5,
+    shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
+    scoreThreshold: 3, erTrendThreshold: 0.2, breakoutLookback: 20,
+    trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
   },
   hourly: {
     shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
@@ -364,7 +366,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     useStopLoss = true, useTarget = true,
     atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
-    trailMultiplier = 1.5, makerFeePct = 0.015, takerFeePct = 0.036, leverage = 1,
+    trailMultiplier = 1.5, makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
   } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
