@@ -189,8 +189,13 @@ const TIMEFRAME_PRESETS = {
     shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
     scoreThreshold: 3, erTrendThreshold: 0.7,
   },
+  // 횡보(단타) 모드 atrMultiplier/riskReward를 따로 튠하지 않아 generateSignal 기본값
+  // (atrMultiplier=2, riskReward=0.8)을 그대로 썼는데, 목표폭(0.8배)이 손절폭보다 좁아
+  // total=3.71%에 그쳤다(실측 n=115 wr=54.8%). atrMultiplier=1.5/riskReward=1.5로 교정해
+  // 평균승(2.412%)>평균패(1.623%) 구조로 정상화했고 total도 3.71%->40.16%(n=112)로 개선.
   fourHour: {
     shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    atrMultiplier: 1.5, riskReward: 1.5,
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 1.5,
   },
