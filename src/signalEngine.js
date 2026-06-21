@@ -213,8 +213,14 @@ const TIMEFRAME_PRESETS = {
     erTrendThreshold: 0.2, breakoutLookback: 30,
     trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3.5,
   },
+  // 횡보(단타) 모드 기본값(atrM=2, rr=0.8) 사용 시 목표폭이 손절폭보다 좁아 total=-96.70%로
+  // 심각하게 망가져 있었음(실측 n=718 wr=47.1%). scoreThreshold=4로 진입 품질을 높이고
+  // atrMultiplier=1.5/riskReward=1.8로 교정해 평균승(0.601%)>평균패(0.495%) 구조로
+  // 정상화, total도 -96.70%->+2.02%(n=38)로 개선. 다만 4시간봉 대비 개선폭이 작아
+  // 통계적으로 약한 신호이므로 향후 추가 데이터로 재검증 필요.
   fiveMin: {
-    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    shortPeriod: 8, longPeriod: 21, scoreThreshold: 4,
+    atrMultiplier: 1.5, riskReward: 1.8,
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
   },
