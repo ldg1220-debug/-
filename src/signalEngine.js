@@ -411,6 +411,13 @@ export function backtest(prices, opts = {}, volumes = null) {
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+    // 추세 모드 피라미딩(분할 추가매수): 추세가 살아있는 동안 가격이 ATR*pyramidStepAtr
+    // 만큼 유리한 방향으로 더 움직일 때마다 추가 진입해 큰 추세를 더 크게 태운다.
+    // 단, 무손절 물타기(사용자가 보낸 실거래 내역에서 확인된 위험 패턴)와 달리 추세가
+    // 꺾여 트레일링 스탑에 닿으면 전량(모든 레그) 동시 청산하므로 손절은 항상 살아있다.
+    // 추가매수마다 비중을 pyramidWeightDecay배로 줄여(기본 0.5) 후반 추가가 과도한
+    // 노출을 만들지 않게 한다. pyramidMaxAdds=0(기본값)이면 기존과 동일하게 동작.
+    pyramidMaxAdds = 0, pyramidStepAtr = 1.5, pyramidWeightDecay = 0.5,
   } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -422,15 +429,22 @@ export function backtest(prices, opts = {}, volumes = null) {
   let highestSinceEntry = null;
   let lastPosition = "관망";
   let entryIndex = null;
+  let entries = [];
+  let lastAddPrice = null;
 
   const atrSeries = atr(prices, atrPeriod);
 
   const closeTrade = (exitPrice, exitReason, exitIndex) => {
-    const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
+    const totalWeight = entries.reduce((acc, e) => acc + e.weight, 0);
+    const grossPct = entries.reduce((acc, e) => acc + e.weight * (exitPrice - e.price) / e.price, 0)
+      / totalWeight * 100 * leverage;
     const exitFeePct = exitReason === "take_profit" ? makerFeePct : takerFeePct;
-    const feePct = takerFeePct + exitFeePct; // 진입(테이커) + 청산(주문유형별)
+    const feePct = takerFeePct + exitFeePct; // 진입(테이커, 모든 레그 동일 비율) + 청산(주문유형별)
     const returnPct = grossPct - feePct;
-    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: entryRegime, feePct });
+    trades.push({
+      entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason,
+      regime: entryRegime, feePct, addCount: entries.length - 1,
+    });
     holding = false;
     entryPrice = null;
     activeStop = null;
@@ -438,6 +452,8 @@ export function backtest(prices, opts = {}, volumes = null) {
     entryRegime = null;
     highestSinceEntry = null;
     entryIndex = null;
+    entries = [];
+    lastAddPrice = null;
   };
 
   for (let i = minBars; i < prices.length; i++) {
@@ -445,6 +461,11 @@ export function backtest(prices, opts = {}, volumes = null) {
       highestSinceEntry = Math.max(highestSinceEntry, prices[i]);
       const curAtr = atrSeries[i];
       if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
+      if (pyramidMaxAdds > 0 && entries.length - 1 < pyramidMaxAdds && curAtr != null
+        && prices[i] - lastAddPrice >= curAtr * pyramidStepAtr) {
+        entries.push({ price: prices[i], weight: Math.pow(pyramidWeightDecay, entries.length) });
+        lastAddPrice = prices[i];
+      }
     }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
       closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss", i);
@@ -477,6 +498,8 @@ export function backtest(prices, opts = {}, volumes = null) {
       activeStop = sig.stopLoss;
       activeTarget = entryRegime === "추세" ? null : (sig.target ? sig.target[0] : null);
       highestSinceEntry = entryRegime === "추세" ? prices[i] : null;
+      entries = [{ price: prices[i], weight: 1 }];
+      lastAddPrice = prices[i];
     } else if (holding && sig.position === "매도") {
       closeTrade(prices[i], "signal_flip", i);
     }
