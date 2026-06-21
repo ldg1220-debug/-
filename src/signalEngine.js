@@ -229,6 +229,7 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     scoreThreshold = 3, trendFilterPeriod = null,
     erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
     breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
+    requirePullback = false, pullbackLookback = 10, pullbackAtrTolerance = 0.5,
   } = withTimeframePreset(opts);
   const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   if (prices.length < minNeeded) {
@@ -340,7 +341,24 @@ export function generateSignal(prices, opts = {}, volumes = null) {
     const breakoutConfirmed = position === "매수"
       ? curPrice > Math.max(...lookbackPrices)
       : curPrice < Math.min(...lookbackPrices);
-    if (!(erRising && breakoutConfirmed)) {
+    // 추가 보강(실거래 분석 참조): 사용자의 실제 수익 매매는 추세 중 단기이동평균
+    // 지지선까지의 되돌림을 기다렸다가 진입하는 패턴이었다. 돌파 직전 N봉 안에
+    // 가격이 EMA(shortPeriod)에 ATR*pullbackAtrTolerance 이내로 근접한 적이
+    // 있어야 진입을 허용해, 되돌림 없이 바로 따라붙는 추격매수를 줄인다.
+    let pullbackConfirmed = true;
+    if (requirePullback) {
+      pullbackConfirmed = false;
+      const pbStart = Math.max(0, last - pullbackLookback);
+      const curAtrForPullback = atrSeries[last];
+      for (let k = pbStart; k < last; k++) {
+        if (emaShort[k] == null || curAtrForPullback == null) continue;
+        if (Math.abs(prices[k] - emaShort[k]) <= curAtrForPullback * pullbackAtrTolerance) {
+          pullbackConfirmed = true;
+          break;
+        }
+      }
+    }
+    if (!(erRising && breakoutConfirmed && pullbackConfirmed)) {
       reasons.push("추세 진입 보류: ER 상승 또는 신고가/신저가 돌파 미확인");
       position = "관망";
     }
@@ -411,6 +429,12 @@ export function backtest(prices, opts = {}, volumes = null) {
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+    requirePullback, pullbackLookback, pullbackAtrTolerance,
+    // ER(추세 강도)이 높을수록 트레일링 스탑을 더 느슨하게 풀어 큰 추세에서
+    // 일찍 털리지 않게 한다. trailErBoost=0(기본값)이면 기존과 동일하게
+    // trailMultiplier를 고정값으로 쓴다. ER이 erTrendThreshold일 때는 보정 없음,
+    // ER이 1에 가까울수록 trailMultiplier*(1+trailErBoost)까지 넓어진다.
+    trailErBoost = 0,
   } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
@@ -424,6 +448,8 @@ export function backtest(prices, opts = {}, volumes = null) {
   let entryIndex = null;
 
   const atrSeries = atr(prices, atrPeriod);
+  const erSeriesForTrail = trailErBoost > 0 ? efficiencyRatio(prices, erPeriod || 14) : null;
+  const erTrendThresholdForTrail = erTrendThreshold != null ? erTrendThreshold : 0.3;
 
   const closeTrade = (exitPrice, exitReason, exitIndex) => {
     const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
@@ -444,7 +470,15 @@ export function backtest(prices, opts = {}, volumes = null) {
     if (holding && entryRegime === "추세") {
       highestSinceEntry = Math.max(highestSinceEntry, prices[i]);
       const curAtr = atrSeries[i];
-      if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
+      let effTrailMultiplier = trailMultiplier;
+      if (trailErBoost > 0 && erSeriesForTrail) {
+        const erVal = erSeriesForTrail[i];
+        if (erVal != null) {
+          const boost = Math.max(0, (erVal - erTrendThresholdForTrail) / Math.max(1e-6, 1 - erTrendThresholdForTrail));
+          effTrailMultiplier = trailMultiplier * (1 + trailErBoost * boost);
+        }
+      }
+      if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * effTrailMultiplier);
     }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
       closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss", i);
@@ -464,6 +498,7 @@ export function backtest(prices, opts = {}, volumes = null) {
         atrPeriod, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
         volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold, trailMultiplier,
         breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+        requirePullback, pullbackLookback, pullbackAtrTolerance,
       }, volWindow);
     } catch {
       continue;
