@@ -194,10 +194,19 @@ const TIMEFRAME_PRESETS = {
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 1.5,
   },
+  // 횡보(단타) 모드는 기존에 atrMultiplier/riskReward를 따로 튠하지 않아 generateSignal
+  // 기본값(atrMultiplier=2, riskReward=0.8)을 그대로 썼는데, 이는 목표폭이 손절폭보다
+  // 좁아(0.8배) 승률이 높아도(60%) 평균손실이 평균수익보다 커지는 구조적 문제가 있었다
+  // (실측: scoreThreshold=3일 때 횡보 n=280 total=-39.70%). scoreThreshold=4로 진입
+  // 품질을 높이고(n 280->20, total -39.70%->+1.25%) atrMultiplier=1/riskReward=1.3으로
+  // 교정해 평균승(0.608%)>평균패(0.480%)로 구조를 정상화했다(total도 1.25%->1.28%로 소폭
+  // 개선). trailMultiplier도 3->3.5로 넓히자 추세 모드 평균수익/거래가 0.356%->0.390%로
+  // 개선돼 채택(레버리지 3배 기준 월 환산 포트폴리오 수익 14.75%->15.35%).
   thirtyMin: {
-    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
+    shortPeriod: 8, longPeriod: 21, scoreThreshold: 4,
+    atrMultiplier: 1, riskReward: 1.3,
     erTrendThreshold: 0.2, breakoutLookback: 30,
-    trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3,
+    trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3.5,
   },
   fiveMin: {
     shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,

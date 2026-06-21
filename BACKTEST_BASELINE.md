@@ -6,13 +6,46 @@ edgeX v1 실데이터(실수수료 taker 0.038%/maker 0.018%)로 검증한 현�
 
 ## 현재 프리셋 (src/signalEngine.js)
 
-| 타임프레임 | shortPeriod | longPeriod | erTrendThreshold | breakoutLookback | trendScoreThreshold | trendAtrMultiplier | trailMultiplier |
-|---|---|---|---|---|---|---|---|
-| daily | 10 | 24 | 0.1 | 5 | 1 | 1.5 | 2 |
-| hourly | 8 | 21 | 0.7 | - | - | - | - |
-| fourHour | 8 | 21 | 0.2 | 20 | 2 | 2 | 1.5 |
-| thirtyMin | 8 | 21 | 0.2 | 30 | 2 | 2.5 | 3 |
-| fiveMin | 8 | 21 | 0.2 | 20 | 2 | 1.5 | 1.5 |
+| 타임프레임 | shortPeriod | longPeriod | erTrendThreshold | breakoutLookback | trendScoreThreshold | trendAtrMultiplier | trailMultiplier | scoreThreshold(횡보) | atrMultiplier(횡보) | riskReward(횡보) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| daily | 10 | 24 | 0.1 | 5 | 1 | 1.5 | 2 | 3 | 1.5 | 1 |
+| hourly | 8 | 21 | 0.7 | - | - | - | - | 3 | 1 | 1 |
+| fourHour | 8 | 21 | 0.2 | 20 | 2 | 2 | 1.5 | 3(미튠) | 2(미튠) | 0.8(미튠) |
+| thirtyMin | 8 | 21 | 0.2 | 30 | 2 | 2.5 | 3.5 | 4 | 1 | 1.3 |
+| fiveMin | 8 | 21 | 0.2 | 20 | 2 | 1.5 | 1.5 | 3(미튠) | 2(미튠) | 0.8(미튠) |
+
+## 횡보(단타) 모드 튜닝 — 2026-06-21
+
+기존에는 `fourHour`/`thirtyMin`/`fiveMin` 프리셋이 횡보(단타) 모드의
+`atrMultiplier`/`riskReward`를 따로 설정하지 않아 `generateSignal` 기본값
+(atrMultiplier=2, riskReward=0.8)을 그대로 썼다. 이는 목표폭이 손절폭의
+0.8배로 손절폭보다 좁아, 승률이 높아도(예: 60%) 평균손실이 평균수익보다
+커지는 구조적 문제가 있었다(실측: 30분봉 횡보 scoreThreshold=3 기준
+n=280, total=-39.70%, 평균=-0.142%).
+
+`thirtyMin`만 다음과 같이 교정(`fourHour`/`fiveMin`은 아직 미작업):
+- `scoreThreshold: 3→4`: 진입 품질을 높여 거래수 280→20, total -39.70%→+1.25%
+- `atrMultiplier: 1, riskReward: 1.3`: 평균승(0.608%) > 평균패(0.480%)로
+  승/패 크기 구조를 정상화(total도 1.25%→1.28%로 소폭 개선)
+- `trailMultiplier: 3→3.5`: 추세 모드 평균수익/거래가 0.356%→0.390%로
+  개선(부수효과로 거래수도 445→458)
+
+부분청산(1차 목표 도달 시 50% 청산 + 잔량 손익분기 보호)도 검증했으나
+모든 atrM/rr 조합에서 기존보다 결과가 나빠 폐기(추가 수수료가 잔량
+보유로 얻는 추가수익보다 큼).
+
+### 30분봉 포트폴리오 시뮬레이션 (20종목 동일비중, 60일 데이터를 30일로 환산)
+
+| 레버리지 | 월 환산 수익률 | 최대낙폭(MDD) |
+|---|---|---|
+| 1x | 4.44% | -14.1% |
+| 2x | 9.86% | -25.7% |
+| 2.5x | 12.59% | -30.9% |
+| 3x | 15.35% | -35.9% |
+
+월 10~15% 목표는 **레버리지 2.5~3배**에서 달성 가능(MDD -31~36% 감수 필요).
+단, 종목별 편차가 커서(60일 기준 ZEC +36.71%~EDGE -10.79%) 일부 저성과
+종목은 레버리지 적용 시 강제청산 위험이 있다는 점에 유의.
 
 ## 검증 데이터 기간 / 종목
 
