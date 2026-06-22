@@ -655,6 +655,55 @@ export function momentumChaseBacktest(prices, opts = {}, volumes = null) {
   };
 }
 
+// momentumChaseBacktest()의 1바 단위 실시간 의사결정 버전. 오케스트레이터가 매
+// 캔들마다 호출해 "지금 진입/청산/유지 중 뭘 해야 하는지"를 받는 용도다.
+// position이 null이면 신규 진입 판정, 있으면 보유 중 포지션의 청산 판정만 한다.
+// 백테스트 루프와 완전히 같은 조건식을 쓰므로 두 함수는 항상 같은 결론을 내야
+// 하며, 이는 verify_live_signal.mjs류 스크립트로 바백테스트 거래 목록과 1:1
+// 대조해 검증한다(라이브 로직이 백테스트와 몰래 갈라지는 걸 막는 안전장치).
+export function momentumChaseSignal(prices, volumes = null, position = null, opts = {}) {
+  const {
+    breakoutLookback = 60, volumeAvgPeriod = 20, volumeSpikeMultiplier = 2.5,
+    erPeriod = 14, breakoutStopPct = 0.03, breakoutTrailPct = 0.04, maxHoldBars = 48,
+  } = opts;
+
+  const i = prices.length - 1;
+  const minBars = Math.max(breakoutLookback, volumeAvgPeriod, erPeriod) + 1;
+  if (i < minBars) return { action: "none" };
+  const price = prices[i];
+
+  if (position) {
+    const { side, entryPrice, entryIndex, extremeSinceEntry: prevExtreme } = position;
+    const extremeSinceEntry = side === "long" ? Math.max(prevExtreme, price) : Math.min(prevExtreme, price);
+    const trailStop = side === "long" ? extremeSinceEntry * (1 - breakoutTrailPct) : extremeSinceEntry * (1 + breakoutTrailPct);
+    const hardStop = side === "long" ? entryPrice * (1 - breakoutStopPct) : entryPrice * (1 + breakoutStopPct);
+    const stopHit = side === "long" ? (price <= trailStop || price <= hardStop) : (price >= trailStop || price >= hardStop);
+    const timeUp = i - entryIndex >= maxHoldBars;
+
+    if (stopHit) {
+      const bindingStop = side === "long" ? Math.max(trailStop, hardStop) : Math.min(trailStop, hardStop);
+      return { action: "exit", exitPrice: bindingStop, exitReason: bindingStop === hardStop ? "stop_loss" : "trailing_stop", extremeSinceEntry };
+    }
+    if (timeUp) return { action: "exit", exitPrice: price, exitReason: "max_hold_expired", extremeSinceEntry };
+    return { action: "hold", extremeSinceEntry };
+  }
+
+  const volAvg = volumes ? trailingAvg(volumes, volumeAvgPeriod) : null;
+  const erSeries = efficiencyRatio(prices, erPeriod);
+  const rollHigh = rollingExtreme(prices, breakoutLookback, (a, b) => a >= b);
+  const rollLow = rollingExtreme(prices, breakoutLookback, (a, b) => a <= b);
+
+  const high = rollHigh[i - 1], low = rollLow[i - 1];
+  const curEr = erSeries[i], prevEr = erSeries[i - 1];
+  const erRising = curEr != null && prevEr != null && curEr > prevEr;
+  const volSpike = volumes && volAvg && volAvg[i] != null ? volumes[i] >= volAvg[i] * volumeSpikeMultiplier : false;
+  if (!volSpike || !erRising || high == null || low == null) return { action: "none" };
+
+  if (price > high) return { action: "enter_long", entryPrice: price };
+  if (price < low) return { action: "enter_short", entryPrice: price };
+  return { action: "none" };
+}
+
 // 다종목 스캐너 — "단타로 하루 수십 차례 거래"를 한 종목의 신호를 억지로 늘려서
 // 채우면 품질이 무너진다(실측: scoreThreshold를 3→2로 낮추자 11종목 합산 승률이
 // 49.5%→45.1%, 수익이 +19.72%→-39.01%로 붕괴). 대신 같은 품질 기준(scoreThreshold=3)을
