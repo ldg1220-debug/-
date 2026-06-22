@@ -280,8 +280,8 @@ qty 199/-1,851 같은 대형 단일 체결 포함, 강제청산 엔진의 단계
 항상 단일 레그, (2) `maxHoldBars`로 보유기간 자체에 상한(기본 48바=24시간,
 30분봉 기준)을 둬 "며칠씩 누적" 구조가 원천적으로 불가능.
 
-edgeX 20종목 30분봉(최근 14일) 그리드서치(breakoutLookback 3종×
-volumeSpikeMultiplier 4종×breakoutStopPct 3종×breakoutTrailPct 3종×
+edgeX 20종목 30분봉(2026-04-21~06-20, 약 60일) 그리드서치(breakoutLookback
+3종×volumeSpikeMultiplier 4종×breakoutStopPct 3종×breakoutTrailPct 3종×
 maxHoldBars 4종, 432콤보)로 검증. 초기값(20바/2.5x/2%손절/2.5%트레일/12바)은
 평균 **-23.0%**로 손실이었으나, breakoutLookback=60/volumeSpikeMultiplier=2.5/
 breakoutStopPct=0.03/breakoutTrailPct=0.04/maxHoldBars=48로 교정하자
@@ -289,6 +289,15 @@ breakoutStopPct=0.03/breakoutTrailPct=0.04/maxHoldBars=48로 교정하자
 견고함)로 개선돼 기본값으로 채택(레버리지 3x). ENA(-80.9%)/PUMP(-61.2%)처럼
 극단적 변동성 종목은 손실이 커 종목당 노출 한도를 포트폴리오 레벨에서
 별도로 둘 필요가 있음.
+
+**아웃오브샘플 검증(거래량 21~30위 추가 10종목, 같은 기간/파라미터)**:
+AAVE/ADA/BCH/CFX/DOT/FIL/ICP/ONDO/PENDLE/VIRTUAL 평균 **-6.72%**(n=26,
+대부분 거래 자체가 1~4건뿐으로 표본 부족). top20과 합친 30종목 전체 평균은
+**+7.66%**(top20 단독 +14.85%보다 하락). 즉 이 엔진은 **거래량 상위
+종목에서만 검증된 엣지**이고, 거래량이 낮은 종목(거래 빈도 자체가 부족해
+거래량 스파이크 판정의 기준선인 volAvg가 잡음에 취약)에는 그대로
+적용하면 안 됨 — 실거래 적용 시 거래량 상위 N개 종목으로 화이트리스트를
+제한하는 것을 권장.
 
 ### 2) `backtest()` 피라미딩 옵션 재도입 (`pyramidEnabled`)
 
@@ -303,6 +312,11 @@ ATR 1배 이상 유리한 방향으로 움직였을 때만(이기고 있을 때�
 기본값은 비활성(`pyramidEnabled: false`, 기존 동작 보존). edgeX 20종목
 4시간봉 백테스트(레버리지 3x, maxPyramidAdds=2/pyramidAddFraction=0.5)에서
 활성화 시 평균 **+38.99%→+43.85%**로 개선 확인.
+
+**아웃오브샘플 검증(거래량 21~30위 추가 10종목, 같은 4시간봉/파라미터)**:
+베이스라인 +29.92%→피라미딩 +31.23%로 top20보다 개선폭은 작지만(약 +1.3%p,
+top20은 +4.9%p) 방향은 일관되게 양(+) — 모멘텀추격과 달리 피라미딩은
+거래량 순위에 덜 민감하게 안정적으로 작동함.
 
 ## 변동성 레짐 스위칭 검토 (미구현, 검증만 완료)
 
