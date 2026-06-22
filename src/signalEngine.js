@@ -766,14 +766,15 @@ function rollingExtreme(values, period, cmp) {
 export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
   const {
     boxLookback = 96,        // 박스 상/하단 산정 구간(바 개수). 30분봉 기준 96바=48시간
-    // boxRangePct/entryBufferPct/boxStopBufferPct: 4개 비중첩 기간(60일 단위, 최대 240일 전까지)
-    // 그리드서치+OOS 검증 결과 채택값. 기존 기본값(0.05/0.005/0.01)은 손절 버퍼가 헐거워
-    // "가짜 박스 이탈"이 큰 손실로 번진 뒤 청산되는 구조였음 — 손절을 타이트하게 좁히고
-    // 박스 유효 폭을 넓히자 승률(24~29%→40~47%)과 평균수익률(13~41%→77~89%)이 4개 기간
-    // 전부에서 동시에 개선됨(트레이드오프 아님). BACKTEST_BASELINE.md 참조.
-    boxRangePct = 0.12,      // 이 진폭(상단-하단)/하단 이하일 때만 "유효한 박스"로 인정
-    entryBufferPct = 0.001,  // 하단+0.1%/상단-0.1%에서 박스권 진입
-    boxStopBufferPct = 0.003, // 박스 하단-0.3%/상단+0.3% 벗어나면 박스권 거래 손절
+    // 주의: boxStopBufferPct를 좁히면 백테스트상 승률/수익률이 크게 좋아지는 것처럼 보이지만,
+    // 이는 청산을 항상 "정확히 stopPrice"에 체결된다고 가정하는 모델의 낙관적 오류 때문임
+    // (실제 종가는 그 값을 평균 0.5~0.6%, 최대 8%+ 넘어서 찍히는 경우가 빈번 — 30분봉+타이트
+    // 스탑+레버리지 조합에서 슬리피지/갭이 큼). 종가 기준으로 재계산하면 해당 후보는 4개 기간
+    // 중 3개에서 오히려 baseline보다 더 나쁨(BACKTEST_BASELINE.md "A버킷 파라미터 변경
+    // 재검토" 참조) — 기각하고 원래 값으로 유지.
+    boxRangePct = 0.05,      // 이 진폭(상단-하단)/하단 이하일 때만 "유효한 박스"로 인정
+    entryBufferPct = 0.005,  // 하단+0.5%/상단-0.5%에서 박스권 진입
+    boxStopBufferPct = 0.01, // 박스 하단-1%/상단+1% 벗어나면 박스권 거래 손절
     volumeAvgPeriod = 20,
     volumeSpikeMultiplier = 3,
     breakoutTrailPct = 0.02,
