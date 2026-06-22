@@ -601,3 +601,144 @@ export function scanMarket(assets, opts = {}) {
   }
   return signals.sort((a, b) => b.confidence - a.confidence);
 }
+
+// 구간 [i-period, i-1] (현재 바 제외)의 평균을 매 인덱스마다 계산. 거래량 스파이크
+// 판정에 현재 바 자체가 평균에 섞여 들어가면 스파이크가 희석되므로 prefix sum으로
+// "직전까지의" 평균을 O(n)에 구한다.
+function trailingAvg(values, period) {
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    if (i >= 1) {
+      out[i] = i >= period ? sum / period : sum / i;
+    }
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+  }
+  return out;
+}
+
+// 구간 [i-period+1, i] 의 최대/최소값을 모노토닉 데크로 O(n)에 계산(롤링 최고가/최저가).
+function rollingExtreme(values, period, cmp) {
+  const out = new Array(values.length).fill(null);
+  const deque = []; // [index, value], cmp 기준으로 정렬 유지
+  for (let i = 0; i < values.length; i++) {
+    while (deque.length && cmp(values[i], deque[deque.length - 1][1])) deque.pop();
+    deque.push([i, values[i]]);
+    while (deque[0][0] <= i - period) deque.shift();
+    if (i >= period - 1) out[i] = deque[0][1];
+  }
+  return out;
+}
+
+// 박스권/돌파 듀얼모드 매매. 평소엔 박스권(RANGE) 모드로 지지선/저항선 사이를
+// 왕복하며 작은 수익을 누적하고, 거래량이 평균 대비 급증하며 박스권을 벗어나면
+// 돌파(BREAKOUT) 모드로 전환해 추세를 추격, 트레일링 스탑으로 청산 후 다시
+// RANGE로 복귀하는 상태머신. (참고: 사용자 제공 의사코드의 RANGE/BREAKOUT_LONG/
+// BREAKOUT_SHORT 전환 로직을 그대로 구현 — 진입/청산에만 0.5%/1%대 버퍼를 둬서
+// 정확히 경계선에 닿아야만 체결되는 비현실적 조건을 완화.)
+export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
+  const {
+    boxLookback = 96,        // 박스 상/하단 산정 구간(바 개수). 30분봉 기준 96바=48시간
+    boxRangePct = 0.05,      // 이 진폭(상단-하단)/하단 이하일 때만 "유효한 박스"로 인정
+    entryBufferPct = 0.005,  // 하단+0.5%/상단-0.5%에서 박스권 진입
+    boxStopBufferPct = 0.01, // 박스 하단-1%/상단+1% 벗어나면 박스권 거래 손절
+    volumeAvgPeriod = 20,
+    volumeSpikeMultiplier = 3,
+    breakoutTrailPct = 0.02,
+    breakoutStopPct = 0.015,
+    makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
+  } = opts;
+
+  const minBars = Math.max(boxLookback, volumeAvgPeriod) + 1;
+  const boxHigh = rollingExtreme(prices, boxLookback, (a, b) => a >= b);
+  const boxLow = rollingExtreme(prices, boxLookback, (a, b) => a <= b);
+  const volAvg = volumes ? trailingAvg(volumes, volumeAvgPeriod) : null;
+
+  const trades = [];
+  let mode = "RANGE"; // RANGE | BREAKOUT_LONG | BREAKOUT_SHORT
+  let holding = false;
+  let entryPrice = null, entryIndex = null, side = null; // side: "long" | "short" (RANGE 모드 거래용)
+  let stopPrice = null, targetPrice = null; // RANGE 모드
+  let extremeSinceEntry = null; // BREAKOUT 모드 트레일링용
+
+  const closeTrade = (exitPrice, exitReason, exitIndex, regimeLabel) => {
+    const dir = side === "short" ? -1 : 1;
+    const grossPct = dir * (exitPrice - entryPrice) / entryPrice * 100 * leverage;
+    const exitFeePct = exitReason === "take_profit" ? makerFeePct : takerFeePct;
+    const feePct = takerFeePct + exitFeePct;
+    const returnPct = grossPct - feePct;
+    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: regimeLabel, feePct, side });
+    holding = false;
+    entryPrice = null; entryIndex = null; side = null;
+    stopPrice = null; targetPrice = null; extremeSinceEntry = null;
+  };
+
+  for (let i = minBars; i < prices.length; i++) {
+    const price = prices[i];
+    // i-1까지(현재 바 제외)의 박스 경계를 써야 "현재가가 박스를 벗어났는지"를
+    // 판단할 수 있다 — i를 포함하면 현재가 자체가 항상 그 범위 안에 들어가
+    // 돌파 조건이 영원히 성립하지 않는다.
+    const high = boxHigh[i - 1], low = boxLow[i - 1];
+    const volSpike = volumes && volAvg && volAvg[i] != null
+      ? volumes[i] >= volAvg[i] * volumeSpikeMultiplier
+      : false;
+
+    if (mode === "RANGE") {
+      if (!holding && volSpike) {
+        if (price > high) mode = "BREAKOUT_LONG";
+        else if (price < low) mode = "BREAKOUT_SHORT";
+        continue; // 이번 바는 모드 전환만, 진입은 다음 바부터
+      }
+
+      if (holding) {
+        if (side === "long") {
+          if (price <= stopPrice) { closeTrade(stopPrice, "stop_loss", i, "박스권"); continue; }
+          if (price >= targetPrice) { closeTrade(targetPrice, "take_profit", i, "박스권"); continue; }
+        } else {
+          if (price >= stopPrice) { closeTrade(stopPrice, "stop_loss", i, "박스권"); continue; }
+          if (price <= targetPrice) { closeTrade(targetPrice, "take_profit", i, "박스권"); continue; }
+        }
+      } else {
+        const boxValid = (high - low) / low <= boxRangePct;
+        if (boxValid && price <= low * (1 + entryBufferPct)) {
+          holding = true; side = "long"; entryPrice = price; entryIndex = i;
+          targetPrice = high * (1 - entryBufferPct);
+          stopPrice = low * (1 - boxStopBufferPct);
+        } else if (boxValid && price >= high * (1 - entryBufferPct)) {
+          holding = true; side = "short"; entryPrice = price; entryIndex = i;
+          targetPrice = low * (1 + entryBufferPct);
+          stopPrice = high * (1 + boxStopBufferPct);
+        }
+      }
+    } else {
+      // BREAKOUT_LONG / BREAKOUT_SHORT
+      const isLong = mode === "BREAKOUT_LONG";
+      if (!holding) {
+        holding = true; side = isLong ? "long" : "short"; entryPrice = price; entryIndex = i;
+        extremeSinceEntry = price;
+      } else {
+        extremeSinceEntry = isLong ? Math.max(extremeSinceEntry, price) : Math.min(extremeSinceEntry, price);
+        const trailStop = isLong ? extremeSinceEntry * (1 - breakoutTrailPct) : extremeSinceEntry * (1 + breakoutTrailPct);
+        const hardStop = isLong ? entryPrice * (1 - breakoutStopPct) : entryPrice * (1 + breakoutStopPct);
+        const hit = isLong ? (price <= trailStop || price <= hardStop) : (price >= trailStop || price >= hardStop);
+        if (hit) {
+          closeTrade(price, price === hardStop ? "stop_loss" : "trailing_stop", i, "돌파");
+          mode = "RANGE";
+        }
+      }
+    }
+  }
+
+  if (holding) closeTrade(prices[prices.length - 1], "open_at_end", prices.length - 1, mode === "RANGE" ? "박스권" : "돌파");
+
+  const wins = trades.filter((t) => t.returnPct > 0).length;
+  const totalReturnPct = trades.reduce((acc, t) => acc + t.returnPct, 0);
+
+  return {
+    trades,
+    tradeCount: trades.length,
+    winRate: trades.length ? (wins / trades.length) * 100 : 0,
+    totalReturnPct,
+  };
+}
