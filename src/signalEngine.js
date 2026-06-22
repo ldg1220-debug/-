@@ -615,7 +615,15 @@ export function momentumChaseBacktest(prices, opts = {}, volumes = null) {
       const hardStop = side === "long" ? entryPrice * (1 - breakoutStopPct) : entryPrice * (1 + breakoutStopPct);
       const stopHit = side === "long" ? (price <= trailStop || price <= hardStop) : (price >= trailStop || price >= hardStop);
       const timeUp = i - entryIndex >= maxHoldBars;
-      if (stopHit) { closeTrade(price, price === hardStop ? "stop_loss" : "trailing_stop", i); continue; }
+      if (stopHit) {
+        // 봉 종가가 손절선을 훌쩍 넘겨도(고변동성 코인의 30분봉 갭) 그 종가로
+        // 청산하면 의도한 손절폭을 한참 초과한 손실이 찍힌다(실측: ENA -25.23%,
+        // PUMP -14%대 등, 의도한 3%×레버리지를 크게 벗어남). boxBreakoutBacktest의
+        // RANGE 모드처럼 정해둔 손절/트레일 레벨 자체로 청산해 의도한 리스크를 지킨다.
+        const bindingStop = side === "long" ? Math.max(trailStop, hardStop) : Math.min(trailStop, hardStop);
+        closeTrade(bindingStop, bindingStop === hardStop ? "stop_loss" : "trailing_stop", i);
+        continue;
+      }
       if (timeUp) { closeTrade(price, "max_hold_expired", i); continue; }
       continue;
     }
