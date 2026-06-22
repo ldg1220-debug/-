@@ -446,15 +446,24 @@ export function backtest(prices, opts = {}, volumes = null) {
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+    // 피라미딩(추세 추종 강화): 추세가 더 강해질 때 "이기고 있는 포지션"에만
+    // 추가 진입한다. RAVEUSDT 사건의 핵심 원인은 손실 중인 숏을 며칠간
+    // 늘려간 것이었으므로, 지는 포지션에 추가하는 불타기(averaging down)는
+    // 절대 하지 않고 가격이 진입 방향으로 더 움직였을 때만(ATR 버퍼 이상
+    // 유리하게 진행) 추가해 추세 구간에서의 수익을 증폭시킨다.
+    pyramidEnabled = false, maxPyramidAdds = 2, pyramidAddFraction = 0.5,
   } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
   let holding = false;
-  let entryPrice = null;
+  let entryPrice = null; // 가중평균 진입가
   let activeStop = null;
   let highestSinceEntry = null;
   let lastPosition = "관망";
   let entryIndex = null;
+  let legs = []; // [{ price, weight }] — 피라미딩 시 진입 단가별 비중 추적
+  let pyramidAdds = 0;
+  let lastAddPrice = null;
 
   const series = computeSeries(prices, volumes, {
     shortPeriod, longPeriod, rsiPeriod, zigzagPct,
@@ -463,15 +472,21 @@ export function backtest(prices, opts = {}, volumes = null) {
   const atrSeries = series.atrSeries;
 
   const closeTrade = (exitPrice, exitReason, exitIndex) => {
-    const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
-    const feePct = takerFeePct * 2; // 진입+청산 모두 시장가(테이커)로 체결된다고 가정
+    const totalWeight = legs.reduce((a, l) => a + l.weight, 0);
+    // 가중 수익률: 각 진입단가별 비중×수익률을 더한다(평단가 1개로 합치는 방식 대신
+    // 레그별로 계산해야 추가매수 시 투입자본이 늘어난 만큼 손익도 정확히 커진다).
+    const grossPct = legs.reduce((a, l) => a + l.weight * (exitPrice - l.price) / l.price, 0) * 100 * leverage;
+    const feePct = takerFeePct * (1 + totalWeight); // 진입(레그별 1회)+청산 1회, 모두 테이커
     const returnPct = grossPct - feePct;
-    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: "추세", feePct });
+    trades.push({ entryPrice: legs[0].price, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: "추세", feePct, pyramidAdds });
     holding = false;
     entryPrice = null;
     activeStop = null;
     highestSinceEntry = null;
     entryIndex = null;
+    legs = [];
+    pyramidAdds = 0;
+    lastAddPrice = null;
   };
 
   for (let i = minBars; i < prices.length; i++) {
@@ -502,8 +517,21 @@ export function backtest(prices, opts = {}, volumes = null) {
       entryIndex = i;
       activeStop = sig.stopLoss;
       highestSinceEntry = prices[i];
+      legs = [{ price: prices[i], weight: 1 }];
+      pyramidAdds = 0;
+      lastAddPrice = prices[i];
     } else if (holding && sig.position === "매도") {
       closeTrade(prices[i], "signal_flip", i);
+    } else if (holding && pyramidEnabled && sig.position === "매수" && pyramidAdds < maxPyramidAdds) {
+      // 불타기(averaging down) 금지: 직전 추가매수 가격보다 ATR*1배 이상
+      // "유리한 방향(상승)"으로 더 움직였을 때만, 즉 이기고 있는 포지션에만 추가한다.
+      const curAtr = atrSeries[i];
+      const favorableMove = curAtr != null && prices[i] >= lastAddPrice + curAtr;
+      if (favorableMove) {
+        legs.push({ price: prices[i], weight: pyramidAddFraction });
+        pyramidAdds += 1;
+        lastAddPrice = prices[i];
+      }
     }
     lastPosition = sig.position;
   }
@@ -523,6 +551,99 @@ export function backtest(prices, opts = {}, volumes = null) {
     totalReturnPct,
     buyHoldReturnPct,
     finalPosition: lastPosition,
+  };
+}
+
+// 모멘텀 돌파 추격 엔진("공격적" 버킷용). RAVEUSDT 실거래 분석에서 확인된 최대
+// 손실 원인은 (1) 숏 포지션을 며칠에 걸쳐 점점 늘려가며 들고 있다가 (2) 급등에
+// 강제청산 캐스케이드로 청산된 것이었다. 이 엔진은 그 두 조건을 구조적으로
+// 차단한다: 패배 중인 포지션에는 절대 추가진입(불타기)하지 않고(승리 중일 때만
+// 추가하는 backtest()의 pyramid 옵션과 달리 이 엔진은 단일 포지션만 보유),
+// maxHoldBars로 보유기간 자체에 상한을 둬 "며칠씩 누적" 구조가 원천적으로
+// 불가능하다. 거래량 스파이크 + N봉 신고가/신저가 돌파 + ER 상승을 동시에
+// 요구해 가짜 돌파를 거른 뒤, 좁은 하드스탑+트레일링스탑으로 빠르게 잘라낸다.
+export function momentumChaseBacktest(prices, opts = {}, volumes = null) {
+  const {
+    // 아래 기본값은 edgeX 20종목 30분봉(최근 14일 구간) 실데이터 그리드서치로
+    // 검증한 값이다(breakoutLookback 3종×volumeSpikeMultiplier 4종×breakoutStopPct
+    // 3종×breakoutTrailPct 3종×maxHoldBars 4종, 총 432콤보). 초기값(20/2.5/2%/2.5%/12바)은
+    // 평균 -23.0%로 손실이었으나, 돌파 판정 구간을 60바(30시간)로 늘리고 손절/트레일을
+    // 3%/4%로 넓히고 보유기간 상한을 48바(24시간)로 늘리자 평균 +14.85%(n=270, 20종목
+        // 중 14종목 양전)로 개선돼 채택. 상위 3건을 제외해도 +109.63%p로 소수 대형거래
+    // 의존도가 낮아 견고함을 확인. ENA/PUMP처럼 변동성이 극단적인 종목은 손실이 커
+    // 단일 종목 노출 한도(포트폴리오 오케스트레이터 레벨)를 두는 것을 권장한다.
+    breakoutLookback = 60,
+    volumeAvgPeriod = 20,
+    volumeSpikeMultiplier = 2.5,
+    erPeriod = 14,
+    breakoutStopPct = 0.03,   // 진입가 기준 하드 손절
+    breakoutTrailPct = 0.04,  // 유리한 쪽 극값 기준 트레일링 스탑
+    maxHoldBars = 48,         // 보유기간 상한 — RAVEUSDT식 "며칠씩 누적" 차단
+    takerFeePct = 0.038, leverage = 1,
+  } = opts;
+
+  const minBars = Math.max(breakoutLookback, volumeAvgPeriod, erPeriod) + 1;
+  if (prices.length <= minBars) {
+    return { trades: [], tradeCount: 0, winRate: 0, totalReturnPct: 0 };
+  }
+
+  const volAvg = volumes ? trailingAvg(volumes, volumeAvgPeriod) : null;
+  const erSeries = efficiencyRatio(prices, erPeriod);
+  const rollHigh = rollingExtreme(prices, breakoutLookback, (a, b) => a >= b);
+  const rollLow = rollingExtreme(prices, breakoutLookback, (a, b) => a <= b);
+
+  const trades = [];
+  let holding = false;
+  let entryPrice = null, entryIndex = null, side = null;
+  let extremeSinceEntry = null;
+
+  const closeTrade = (exitPrice, exitReason, exitIndex) => {
+    const dir = side === "short" ? -1 : 1;
+    const grossPct = dir * (exitPrice - entryPrice) / entryPrice * 100 * leverage;
+    const feePct = takerFeePct * 2;
+    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct: grossPct - feePct, exitReason, regime: "모멘텀추격", side });
+    holding = false;
+    entryPrice = null; entryIndex = null; side = null; extremeSinceEntry = null;
+  };
+
+  for (let i = minBars; i < prices.length; i++) {
+    const price = prices[i];
+
+    if (holding) {
+      extremeSinceEntry = side === "long" ? Math.max(extremeSinceEntry, price) : Math.min(extremeSinceEntry, price);
+      const trailStop = side === "long" ? extremeSinceEntry * (1 - breakoutTrailPct) : extremeSinceEntry * (1 + breakoutTrailPct);
+      const hardStop = side === "long" ? entryPrice * (1 - breakoutStopPct) : entryPrice * (1 + breakoutStopPct);
+      const stopHit = side === "long" ? (price <= trailStop || price <= hardStop) : (price >= trailStop || price >= hardStop);
+      const timeUp = i - entryIndex >= maxHoldBars;
+      if (stopHit) { closeTrade(price, price === hardStop ? "stop_loss" : "trailing_stop", i); continue; }
+      if (timeUp) { closeTrade(price, "max_hold_expired", i); continue; }
+      continue;
+    }
+
+    // i-1까지의 롤링 고저/거래량평균을 써야 현재 바가 "돌파했는지"를 판단할 수 있다.
+    const high = rollHigh[i - 1], low = rollLow[i - 1];
+    const curEr = erSeries[i], prevEr = erSeries[i - 1];
+    const erRising = curEr != null && prevEr != null && curEr > prevEr;
+    const volSpike = volumes && volAvg && volAvg[i] != null ? volumes[i] >= volAvg[i] * volumeSpikeMultiplier : false;
+    if (!volSpike || !erRising || high == null || low == null) continue;
+
+    if (price > high) {
+      holding = true; side = "long"; entryPrice = price; entryIndex = i; extremeSinceEntry = price;
+    } else if (price < low) {
+      holding = true; side = "short"; entryPrice = price; entryIndex = i; extremeSinceEntry = price;
+    }
+  }
+
+  if (holding) closeTrade(prices[prices.length - 1], "open_at_end", prices.length - 1);
+
+  const wins = trades.filter((t) => t.returnPct > 0).length;
+  const totalReturnPct = trades.reduce((acc, t) => acc + t.returnPct, 0);
+
+  return {
+    trades,
+    tradeCount: trades.length,
+    winRate: trades.length ? (wins / trades.length) * 100 : 0,
+    totalReturnPct,
   };
 }
 
