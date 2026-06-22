@@ -2,6 +2,11 @@
 // 입력: 시계열 가격 배열 [{t, price}, ...] (오래된 -> 최신 순)
 // 출력: 결정론적 매수/매도/관망 신호 + 근거 지표값 (LLM이 임의로 만들어내지 않도록 고정)
 
+// computeSeries/signalAt이 공유하는 기본값. 한쪽만 고치고 다른 쪽을 빠뜨려
+// 결과가 갈라지는 것을 막기 위해 상수로 분리한다.
+const DEFAULT_SHORT_PERIOD = 8;
+const DEFAULT_LONG_PERIOD = 21;
+
 export function sma(values, period) {
   const out = new Array(values.length).fill(null);
   let sum = 0;
@@ -59,13 +64,18 @@ export function efficiencyRatio(values, period = 14) {
   return out;
 }
 
+// 거래량 확인 본체. volumes가 prices보다 짧을 수 있으므로(예: 거래량 데이터 누락)
+// last가 volumes 범위를 벗어나면 null을 반환해 인덱싱 오류를 막는다.
+function volumeConfirmedAt(volumes, volAvg, last, multiplier) {
+  if (!volumes || last >= volumes.length || !volAvg || volAvg[last] == null) return null;
+  return volumes[last] > volAvg[last] * multiplier;
+}
+
 // 거래량 확인: 현재 거래량이 평균 대비 기준치 이상이면 신호에 신뢰도를 더한다.
 export function volumeConfirmed(volumes, period = 20, multiplier = 1.2) {
   if (!volumes || volumes.length <= period) return null;
   const avg = sma(volumes, period);
-  const last = volumes.length - 1;
-  if (avg[last] == null) return null;
-  return volumes[last] > avg[last] * multiplier;
+  return volumeConfirmedAt(volumes, avg, volumes.length - 1, multiplier);
 }
 
 // Wilder's RSI
@@ -89,57 +99,11 @@ export function rsi(values, period = 14) {
   return out;
 }
 
-// 지그재그 스윙 포인트 탐색 (엘리엇 파동 카운트 / 피보나치 기준점 추출용)
-export function zigzag(values, pctThreshold = 0.05) {
-  if (values.length < 2) return [];
-  const pivots = [{ index: 0, price: values[0] }];
-  let lastExtremeIdx = 0;
-  let lastExtremeVal = values[0];
-  let direction = null; // 'up' | 'down'
-
-  for (let i = 1; i < values.length; i++) {
-    const v = values[i];
-    if (direction === null) {
-      if (Math.abs(v - lastExtremeVal) / lastExtremeVal >= pctThreshold) {
-        direction = v > lastExtremeVal ? "up" : "down";
-        lastExtremeIdx = i;
-        lastExtremeVal = v;
-      }
-      continue;
-    }
-    if (direction === "up") {
-      if (v >= lastExtremeVal) {
-        lastExtremeVal = v;
-        lastExtremeIdx = i;
-      } else if ((lastExtremeVal - v) / lastExtremeVal >= pctThreshold) {
-        pivots.push({ index: lastExtremeIdx, price: lastExtremeVal });
-        direction = "down";
-        lastExtremeVal = v;
-        lastExtremeIdx = i;
-      }
-    } else {
-      if (v <= lastExtremeVal) {
-        lastExtremeVal = v;
-        lastExtremeIdx = i;
-      } else if ((v - lastExtremeVal) / lastExtremeVal >= pctThreshold) {
-        pivots.push({ index: lastExtremeIdx, price: lastExtremeVal });
-        direction = "up";
-        lastExtremeVal = v;
-        lastExtremeIdx = i;
-      }
-    }
-  }
-  pivots.push({ index: lastExtremeIdx, price: lastExtremeVal });
-  return pivots;
-}
-
-// zigzag와 동일한 알고리즘이지만, 확정된 피벗 목록과 별개로 "아직 확정 안 된
-// 진행 중인 극값"을 매 인덱스마다 기록한다. zigzag()는 배열 끝에서 이 진행 중인
-// 극값을 마지막 피벗으로 무조건 추가하는데(line 132), 이는 배열이 어디서
-// 끝나는지에 따라 달라지는 비인과적 값이라 전체 배열에 대해 한 번만 계산해
-// 인덱스로 조회하는 최적화와 맞지 않는다. 시점 i에서의 zigzag(prices.slice(0,i+1))
-// 결과(=confirmed 중 index<=i 인 것 + 그 시점의 진행 중인 극값)를 그대로 재현하려면
-// 이 진행 중인 극값을 인덱스별로 따로 추적해야 한다.
+// 지그재그 알고리즘 본체. 확정된 피벗(confirmed)과 별개로 "아직 확정 안 된
+// 진행 중인 극값"을 매 인덱스마다 기록한다(pendingIdx/pendingVal). 이 진행 중
+// 극값은 배열이 어디서 끝나는지(미래 데이터)에 따라 달라지는 비인과적 값이라,
+// 시점 i에서의 zigzag(prices.slice(0,i+1)) 결과(=confirmedAt<=i인 확정 피벗 +
+// 그 시점의 진행 중인 극값)를 인덱스로 조회해 재현하려면 별도로 추적해야 한다.
 function zigzagPending(values, pctThreshold = 0.05) {
   const confirmed = [{ index: 0, price: values[0], confirmedAt: 0 }];
   const pendingIdx = new Array(values.length).fill(0);
@@ -182,6 +146,18 @@ function zigzagPending(values, pctThreshold = 0.05) {
     pendingVal[i] = lastExtremeVal;
   }
   return { confirmed, pendingIdx, pendingVal };
+}
+
+// 지그재그 스윙 포인트 탐색 (엘리엇 파동 카운트 / 피보나치 기준점 추출용).
+// zigzagPending()의 얇은 래퍼 — 두 함수가 같은 피벗 판정 로직을 따로 들고
+// 있다가 한쪽만 고쳐 결과가 갈라지는 것을 막기 위해 본체를 공유한다.
+export function zigzag(values, pctThreshold = 0.05) {
+  if (values.length < 2) return [];
+  const { confirmed, pendingIdx, pendingVal } = zigzagPending(values, pctThreshold);
+  const last = values.length - 1;
+  const pivots = confirmed.map(({ index, price }) => ({ index, price }));
+  pivots.push({ index: pendingIdx[last], price: pendingVal[last] });
+  return pivots;
 }
 
 export function fibonacciLevels(low, high) {
@@ -297,7 +273,7 @@ function withTimeframePreset(opts) {
 // 한 번만 계산해 인덱스로 조회하는 방식으로 O(n)에 맞춘다.
 function computeSeries(prices, volumes, opts) {
   const {
-    shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
+    shortPeriod = DEFAULT_SHORT_PERIOD, longPeriod = DEFAULT_LONG_PERIOD, rsiPeriod = 14, zigzagPct = 0.05,
     atrPeriod = 14, erPeriod = 14, trendFilterPeriod = null, volumePeriod = 20,
   } = opts;
   return {
@@ -315,7 +291,7 @@ function computeSeries(prices, volumes, opts) {
 // series 기반 신호 계산: prices/series 전체를 그대로 두고 시점 last에서의 신호만 평가한다.
 function signalAt(prices, series, last, volumes, opts) {
   const {
-    shortPeriod = 8, longPeriod = 21,
+    shortPeriod = DEFAULT_SHORT_PERIOD, longPeriod = DEFAULT_LONG_PERIOD,
     atrMultiplier = 2, riskReward = 0.8,
     volumeMultiplier = 1.2,
     scoreThreshold = 3, trendFilterPeriod = null,
@@ -381,9 +357,7 @@ function signalAt(prices, series, last, volumes, opts) {
   if (nearFibSupport) { score += 1; reasons.push("피보나치 지지선 근접"); }
   if (nearFibResistance) { score -= 1; reasons.push("피보나치 저항선 근접"); }
 
-  const volConfirmed = volumes && volAvg && volAvg[last] != null
-    ? volumes[last] > volAvg[last] * volumeMultiplier
-    : null;
+  const volConfirmed = volumeConfirmedAt(volumes, volAvg, last, volumeMultiplier);
   if (volConfirmed === true) {
     if (score > 0) { score += 1; reasons.push("거래량 동반 (신호 확인)"); }
     else if (score < 0) { score -= 1; reasons.push("거래량 동반 (신호 확인)"); }
@@ -560,12 +534,17 @@ export function backtest(prices, opts = {}, volumes = null) {
       continue;
     }
 
-    const sig = signalAt(prices, series, i, volumes, {
-      shortPeriod, longPeriod,
-      atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
-      volumeMultiplier, erTrendThreshold, trailMultiplier,
-      breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
-    });
+    let sig;
+    try {
+      sig = signalAt(prices, series, i, volumes, {
+        shortPeriod, longPeriod,
+        atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+        volumeMultiplier, erTrendThreshold,
+        breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+      });
+    } catch {
+      continue;
+    }
 
     if (!holding && sig.position === "매수") {
       holding = true;
