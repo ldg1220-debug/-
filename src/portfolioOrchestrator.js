@@ -24,12 +24,19 @@ export const ACCOUNT_MAP = {
 // 두 기간 모두 재현됐다.
 export const MOMENTUM_CHASE_SYMBOLS = ["BTC", "ETH", "HYPE", "BNB"];
 
+// 종목당 노출 한도 — HYPE 비중 틸트(40%) 시도는 buy&hold 효과로 판명돼
+// 기각했지만(BACKTEST_BASELINE.md 참조), 그렇다고 한도 자체가 없으면
+// 모멘텀추격이 한 종목에 몰려서 들어갈 때(같은 시점에 여러 봉 연속 신호 등)
+// 실질적으로 한 종목 베팅이 되어버릴 위험은 남는다. 그래서 종목당 균등
+// 비중(1/N)을 상한으로 강제한다 — 틸트는 안 하지만 무한정 몰리는 것도 막는다.
+const equalWeight = 1 / MOMENTUM_CHASE_SYMBOLS.length;
+
 // 3) B버킷 모멘텀추격 신호 사이클 — 매 캔들마다 메이저별로 호출. positions는
 // 심볼별 현재 보유 상태({side, entryPrice, entryIndex, extremeSinceEntry} | null)를
 // 호출자가 들고 있다가 넘겨준다(이 함수는 상태를 들고 있지 않고 매번 입력받음).
 // candles: { [symbol]: { prices, volumes } } — 심볼별 최신 시점까지의 시계열.
 export function runMomentumChaseCycle(candles, positions, opts = {}) {
-  const { dryRun = true, ...signalOpts } = opts;
+  const { dryRun = true, maxSymbolExposurePct = equalWeight, ...signalOpts } = opts;
   const results = {};
 
   for (const symbol of MOMENTUM_CHASE_SYMBOLS) {
@@ -40,14 +47,17 @@ export function runMomentumChaseCycle(candles, positions, opts = {}) {
 
     const orders = [];
     if (sig.action === "enter_long" || sig.action === "enter_short") {
-      orders.push({ account: ACCOUNT_MAP.B.account, container: ACCOUNT_MAP.B.container, op: "placeOrder", symbol, side: sig.action === "enter_long" ? "buy" : "sell" });
+      orders.push({
+        account: ACCOUNT_MAP.B.account, container: ACCOUNT_MAP.B.container, op: "placeOrder",
+        symbol, side: sig.action === "enter_long" ? "buy" : "sell", sizeFraction: maxSymbolExposurePct,
+      });
     } else if (sig.action === "exit") {
       orders.push({ account: ACCOUNT_MAP.B.account, container: ACCOUNT_MAP.B.container, op: "closePosition", symbol });
     }
 
     if (!dryRun) {
       for (const o of orders) {
-        if (o.op === "placeOrder") exchangeClient.placeOrder(o.account, o.container, { symbol: o.symbol, side: o.side, type: "market" });
+        if (o.op === "placeOrder") exchangeClient.placeOrder(o.account, o.container, { symbol: o.symbol, side: o.side, type: "market", sizeFraction: o.sizeFraction });
         else exchangeClient.closePosition(o.account, o.container, o.symbol);
       }
     }
