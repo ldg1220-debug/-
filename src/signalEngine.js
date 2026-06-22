@@ -206,55 +206,32 @@ export function elliottWaveHint(pivots) {
 // breakoutLookback=5/trendScoreThreshold=1/erTrendThreshold=0.1/trailMultiplier=2로
 // 진입 문턱을 낮추자 거래수가 94->198건으로 늘면서 후반부도 -46.65%->+49.90%로
 // 손실에서 양전환됐고 견고성(exclTop3, 상위3거래 제외 수익)도 86%->351%로 개선돼 채택.
+// 과거엔 ER<erTrendThreshold(비추세 구간)에서도 ATR 고정 손절/목표가로 진입하는
+// "횡보" 모드가 있었으나, 같은 평균회귀 컨셉을 더 정교하게 구현한 박스권 전용 엔진
+// boxBreakoutBacktest()가 실측으로 압도적으로 우월함이 확인되어(동일 구간·레버리지
+// 비교: 횡보 n=5 total=-0.07% vs 박스권 n=112 total=+3.80%) 폐기했다. 이제 이 엔진은
+// 추세 추종 전용이며, 비추세 구간에서는 관망한다.
 const TIMEFRAME_PRESETS = {
   daily: {
-    shortPeriod: 10, longPeriod: 24, atrMultiplier: 1.5, riskReward: 1,
-    scoreThreshold: 3, erTrendThreshold: 0.1, breakoutLookback: 5,
+    shortPeriod: 10, longPeriod: 24,
+    erTrendThreshold: 0.1, breakoutLookback: 5,
     trendScoreThreshold: 1, trendAtrMultiplier: 1.5, trailMultiplier: 2,
   },
   hourly: {
-    shortPeriod: 8, longPeriod: 21, atrMultiplier: 1, riskReward: 1,
-    scoreThreshold: 3, erTrendThreshold: 0.7,
+    shortPeriod: 8, longPeriod: 21, erTrendThreshold: 0.7,
   },
-  // 횡보(단타) 모드 atrMultiplier/riskReward를 따로 튠하지 않아 generateSignal 기본값
-  // (atrMultiplier=2, riskReward=0.8)을 그대로 썼는데, 목표폭(0.8배)이 손절폭보다 좁아
-  // total=3.71%에 그쳤다(실측 n=115 wr=54.8%). atrMultiplier=1.5/riskReward=1.5로 교정해
-  // 평균승(2.412%)>평균패(1.623%) 구조로 정상화했고 total도 3.71%->40.16%(n=112)로 개선.
   fourHour: {
-    shortPeriod: 8, longPeriod: 21, scoreThreshold: 3,
-    atrMultiplier: 1.5, riskReward: 1.5,
+    shortPeriod: 8, longPeriod: 21,
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 2, trailMultiplier: 1.5,
   },
-  // 횡보(단타) 모드는 기존에 atrMultiplier/riskReward를 따로 튠하지 않아 generateSignal
-  // 기본값(atrMultiplier=2, riskReward=0.8)을 그대로 썼는데, 이는 목표폭이 손절폭보다
-  // 좁아(0.8배) 승률이 높아도(60%) 평균손실이 평균수익보다 커지는 구조적 문제가 있었다
-  // (실측: scoreThreshold=3일 때 횡보 n=280 total=-39.70%). scoreThreshold=4로 진입
-  // 품질을 높이고(n 280->20, total -39.70%->+1.25%) atrMultiplier=1/riskReward=1.3으로
-  // 교정해 평균승(0.608%)>평균패(0.480%)로 구조를 정상화했다(total도 1.25%->1.28%로 소폭
-  // 개선). trailMultiplier도 3->3.5로 넓히자 추세 모드 평균수익/거래가 0.356%->0.390%로
-  // 개선돼 채택(레버리지 3배 기준 월 환산 포트폴리오 수익 14.75%->15.35%).
   thirtyMin: {
-    shortPeriod: 8, longPeriod: 21, scoreThreshold: 4,
-    atrMultiplier: 1, riskReward: 1.3,
+    shortPeriod: 8, longPeriod: 21,
     erTrendThreshold: 0.2, breakoutLookback: 30,
     trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3.5,
   },
-  // 횡보(단타) 모드 기본값(atrM=2, rr=0.8) 사용 시 목표폭이 손절폭보다 좁아 total=-96.70%로
-  // 심각하게 망가져 있었음(실측 n=718 wr=47.1%, 21일치 데이터). scoreThreshold=4로 진입
-  // 품질을 높이고 atrMultiplier=1.5/riskReward=1.8로 교정해 total -96.70%->+2.02%(n=38)로
-  // 개선했으나 n이 작아 통계적으로 약하다고 판단, 데이터를 21일->60일(17,279봉/종목)로
-  // 보강 후 재검증(backtest() O(n^2)->O(n) 최적화 후 동일 결과 재현 확인 완료, 아래 참고).
-  // 보강된 데이터에서는 기존 atrM=1.5/rr=1.8이 오히려 total=-1.48%로 악화돼 rr을
-  // 0.8~5까지 넓게 그리드서치, atrMultiplier=1.8/riskReward=4.5가 total=+12.80%(n=121)로
-  // 최고였으나, 상위 3건의 거래를 제외하면 -0.77%로 역전돼(승률도 27.3%로 낮음) 소수
-  // 거래에 크게 의존하는 약한 신호임이 재확인됐다. 다만 시도한 모든 조합 중 exclTop3가
-  // 가장 양호하고(-0.77%, 다른 후보는 -1.02%~-7.11%) 종목별로도 20종목 중 12종목이
-  // 양수라 상대적으로는 가장 분산된 결과라 채택. 실거래 투입 시 5분봉 단타는 4시간봉
-  // 대비 신뢰도가 낮으므로 비중을 낮게 잡거나 추가 데이터로 지속 재검증 필요.
   fiveMin: {
-    shortPeriod: 8, longPeriod: 21, scoreThreshold: 4,
-    atrMultiplier: 1.8, riskReward: 4.5,
+    shortPeriod: 8, longPeriod: 21,
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
   },
@@ -292,9 +269,8 @@ function computeSeries(prices, volumes, opts) {
 function signalAt(prices, series, last, volumes, opts) {
   const {
     shortPeriod = DEFAULT_SHORT_PERIOD, longPeriod = DEFAULT_LONG_PERIOD,
-    atrMultiplier = 2, riskReward = 0.8,
     volumeMultiplier = 1.2,
-    scoreThreshold = 3, trendFilterPeriod = null,
+    trendFilterPeriod = null,
     erTrendThreshold = 0.3,
     breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
   } = opts;
@@ -333,12 +309,11 @@ function signalAt(prices, series, last, volumes, opts) {
     }
   }
 
-  // 시장 국면 판별: ER이 높으면(추세장) 추세추종 모드 - 목표가를 고정하지 않고
-  // 트레일링 스탑으로 수익을 최대한 끌고 간다. ER이 낮으면(횡보장) 단타 모드 -
-  // 기존처럼 손익비를 고정한 빠른 익절/손절을 사용한다. 단일 종목/단일 전략에
-  // 고정하지 않고 같은 자산이라도 구간에 따라 모드를 전환하기 위한 장치다.
+  // 시장 국면 판별: ER이 높으면(추세장) 추세추종 모드로 진입 후보가 되고, 낮으면
+  // (비추세 구간) 관망한다. 평균회귀(박스권) 거래는 별도 엔진 boxBreakoutBacktest()가
+  // 전담하므로 여기서는 추세 추종만 다룬다.
   const curEr = erSeries[last];
-  const regime = curEr != null && curEr >= erTrendThreshold ? "추세" : "횡보";
+  const regime = curEr != null && curEr >= erTrendThreshold ? "추세" : "비추세";
 
   const reasons = [];
   let score = 0; // -3..+3
@@ -379,14 +354,11 @@ function signalAt(prices, series, last, volumes, opts) {
     }
   }
 
-  // 횡보(단타) 모드는 승률을 우선해 엄격한 scoreThreshold를 쓰고, 추세 모드는
-  // 승률보다 손익비를 우선하므로(소수의 큰 추세를 잡는 게 목적) 더 낮은
-  // trendScoreThreshold로 진입 기회 자체를 넓힌다 — 대신 아래의 돌파/ER상승
-  // 확인으로 품질을 보강한다.
-  const effectiveThreshold = regime === "추세" ? trendScoreThreshold : scoreThreshold;
   let position = "관망";
-  if (score >= effectiveThreshold) position = "매수";
-  else if (score <= -effectiveThreshold) position = "매도";
+  if (regime === "추세") {
+    if (score >= trendScoreThreshold) position = "매수";
+    else if (score <= -trendScoreThreshold) position = "매도";
+  }
 
   // 추세추종 진입 보강: EMA 골든/데드크로스만으로는 추세가 이미 꺾이기 시작한
   // 끝물에 들어가 트레일링 스탑에 바로 걸리는 경우가 대부분이었다(실측: 19건 중
@@ -404,22 +376,16 @@ function signalAt(prices, series, last, volumes, opts) {
     }
   }
 
-  // ATR 기반 동적 손절/목표가: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
-  // 추세 모드는 초기 손절을 더 넓게 잡아야(trendAtrMultiplier) 진입 직후 흔들림에
-  // 바로 털리지 않고 트레일링 스탑까지 갈 기회를 준다.
+  // ATR 기반 초기 손절: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
+  // trendAtrMultiplier를 넓게 잡아야 진입 직후 흔들림에 바로 털리지 않고
+  // 트레일링 스탑까지 갈 기회를 준다. 목표가는 정해두지 않고(null) 백테스트에서
+  // 트레일링 스탑으로 관리한다.
   const curAtr = atrSeries[last];
-  const effectiveAtrMultiplier = regime === "추세" ? trendAtrMultiplier : atrMultiplier;
-  const riskDistance = curAtr != null ? curAtr * effectiveAtrMultiplier : curPrice * 0.02;
+  const riskDistance = curAtr != null ? curAtr * trendAtrMultiplier : curPrice * 0.02;
   const stopLoss = position === "매수" ? curPrice - riskDistance
     : position === "매도" ? curPrice + riskDistance
     : null;
-  // 추세 모드에서는 목표가를 정해두지 않고(null) 백테스트에서 트레일링 스탑으로 관리한다.
-  const target = regime === "추세" ? null
-    : position === "매수"
-    ? [curPrice + riskDistance * riskReward, curPrice + riskDistance * riskReward * 1.5]
-    : position === "매도"
-    ? [curPrice - riskDistance * riskReward, curPrice - riskDistance * riskReward * 1.5]
-    : null;
+  const target = null;
 
   return {
     position,
@@ -464,27 +430,21 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   return signalAt(prices, series, prices.length - 1, volumes, resolved);
 }
 
-// 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치 | 목표가 터치) 시 청산.
-// 손절/목표가를 실제로 체결에 반영해야 ATR 기반 리스크관리 효과를 검증할 수 있다.
-//
-// 국면별 청산 방식 분리 (단타 vs 추세매매):
-//  - 진입 시점의 시장 국면(regime)이 "횡보"면 기존처럼 ATR 기반 고정 손절/목표가로
-//    빠르게 익절/손절하는 단타 방식을 그대로 쓴다.
-//  - "추세"면 목표가를 두지 않고, 진입 후 갈아탄 최고가(롱) 대비 ATR*trailMultiplier
-//    만큼 따라오는 트레일링 스탑만 사용해 추세가 꺾이기 전까지 수익을 최대한 끌고 간다.
-//    같은 엔진/같은 자산이라도 구간별 국면에 따라 자동으로 전략을 바꾸는 자율 전환 장치.
-//  - makerFeePct/takerFeePct: 거래소 메이커/테이커 수수료(예: 0.015% / 0.036%). 진입은
-//    신호 발생 즉시 체결되는 시장가(테이커)로 가정한다. 청산은 take_profit만 목표가에
-//    걸어둔 리밋 주문(메이커)으로, 그 외(손절/트레일링/신호전환/만기청산)는 즉시 체결이
-//    필요한 시장가(테이커)로 가정해 거래별로 다른 수수료를 차감한다. 레버리지는 수익률에
+// 워크포워드 백테스트(추세 추종 전용): 비추세 구간의 ATR 고정 손절/목표가 평균회귀
+// ("횡보" 모드)는 boxBreakoutBacktest()로 대체되어 폐기됐다. 매수 신호 진입, (매도
+// 신호 | 트레일링 스탑 터치) 시 청산.
+//  - 진입 후 갈아탄 최고가(롱) 대비 ATR*trailMultiplier만큼 따라오는 트레일링
+//    스탑만 사용해 추세가 꺾이기 전까지 수익을 최대한 끌고 간다.
+//  - takerFeePct: 거래소 테이커 수수료(예: 0.038%). 진입/청산 모두 즉시 체결이
+//    필요한 시장가로 가정해 양방향 차감한다. 레버리지는 수익률에
 //    단순 배율로 곱해지므로(강제청산 위험은 별도 고려 필요) leverage로 적용한다.
 export function backtest(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
-    useStopLoss = true, useTarget = true,
-    atrPeriod = 14, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+    useStopLoss = true,
+    atrPeriod = 14, trendFilterPeriod,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
-    trailMultiplier = 1.5, makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
+    trailMultiplier = 1.5, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
   } = withTimeframePreset(opts);
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
@@ -492,8 +452,6 @@ export function backtest(prices, opts = {}, volumes = null) {
   let holding = false;
   let entryPrice = null;
   let activeStop = null;
-  let activeTarget = null;
-  let entryRegime = null;
   let highestSinceEntry = null;
   let lastPosition = "관망";
   let entryIndex = null;
@@ -506,39 +464,31 @@ export function backtest(prices, opts = {}, volumes = null) {
 
   const closeTrade = (exitPrice, exitReason, exitIndex) => {
     const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
-    const exitFeePct = exitReason === "take_profit" ? makerFeePct : takerFeePct;
-    const feePct = takerFeePct + exitFeePct; // 진입(테이커) + 청산(주문유형별)
+    const feePct = takerFeePct * 2; // 진입+청산 모두 시장가(테이커)로 체결된다고 가정
     const returnPct = grossPct - feePct;
-    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: entryRegime, feePct });
+    trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: "추세", feePct });
     holding = false;
     entryPrice = null;
     activeStop = null;
-    activeTarget = null;
-    entryRegime = null;
     highestSinceEntry = null;
     entryIndex = null;
   };
 
   for (let i = minBars; i < prices.length; i++) {
-    if (holding && entryRegime === "추세") {
+    if (holding) {
       highestSinceEntry = Math.max(highestSinceEntry, prices[i]);
       const curAtr = atrSeries[i];
       if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
     }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
-      closeTrade(activeStop, entryRegime === "추세" ? "trailing_stop" : "stop_loss", i);
-      continue;
-    }
-    if (holding && useTarget && activeTarget != null && prices[i] >= activeTarget) {
-      closeTrade(activeTarget, "take_profit", i);
+      closeTrade(activeStop, "trailing_stop", i);
       continue;
     }
 
     let sig;
     try {
       sig = signalAt(prices, series, i, volumes, {
-        shortPeriod, longPeriod,
-        atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+        shortPeriod, longPeriod, trendFilterPeriod,
         volumeMultiplier, erTrendThreshold,
         breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
       });
@@ -550,10 +500,8 @@ export function backtest(prices, opts = {}, volumes = null) {
       holding = true;
       entryPrice = prices[i];
       entryIndex = i;
-      entryRegime = sig.indicators.regime;
       activeStop = sig.stopLoss;
-      activeTarget = entryRegime === "추세" ? null : (sig.target ? sig.target[0] : null);
-      highestSinceEntry = entryRegime === "추세" ? prices[i] : null;
+      highestSinceEntry = prices[i];
     } else if (holding && sig.position === "매도") {
       closeTrade(prices[i], "signal_flip", i);
     }
