@@ -133,6 +133,57 @@ export function zigzag(values, pctThreshold = 0.05) {
   return pivots;
 }
 
+// zigzag와 동일한 알고리즘이지만, 확정된 피벗 목록과 별개로 "아직 확정 안 된
+// 진행 중인 극값"을 매 인덱스마다 기록한다. zigzag()는 배열 끝에서 이 진행 중인
+// 극값을 마지막 피벗으로 무조건 추가하는데(line 132), 이는 배열이 어디서
+// 끝나는지에 따라 달라지는 비인과적 값이라 전체 배열에 대해 한 번만 계산해
+// 인덱스로 조회하는 최적화와 맞지 않는다. 시점 i에서의 zigzag(prices.slice(0,i+1))
+// 결과(=confirmed 중 index<=i 인 것 + 그 시점의 진행 중인 극값)를 그대로 재현하려면
+// 이 진행 중인 극값을 인덱스별로 따로 추적해야 한다.
+function zigzagPending(values, pctThreshold = 0.05) {
+  const confirmed = [{ index: 0, price: values[0], confirmedAt: 0 }];
+  const pendingIdx = new Array(values.length).fill(0);
+  const pendingVal = new Array(values.length).fill(values[0]);
+  if (values.length < 2) return { confirmed, pendingIdx, pendingVal };
+  let lastExtremeIdx = 0;
+  let lastExtremeVal = values[0];
+  let direction = null;
+
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i];
+    if (direction === null) {
+      if (Math.abs(v - lastExtremeVal) / lastExtremeVal >= pctThreshold) {
+        direction = v > lastExtremeVal ? "up" : "down";
+        lastExtremeIdx = i;
+        lastExtremeVal = v;
+      }
+    } else if (direction === "up") {
+      if (v >= lastExtremeVal) {
+        lastExtremeVal = v;
+        lastExtremeIdx = i;
+      } else if ((lastExtremeVal - v) / lastExtremeVal >= pctThreshold) {
+        confirmed.push({ index: lastExtremeIdx, price: lastExtremeVal, confirmedAt: i });
+        direction = "down";
+        lastExtremeVal = v;
+        lastExtremeIdx = i;
+      }
+    } else {
+      if (v <= lastExtremeVal) {
+        lastExtremeVal = v;
+        lastExtremeIdx = i;
+      } else if ((v - lastExtremeVal) / lastExtremeVal >= pctThreshold) {
+        confirmed.push({ index: lastExtremeIdx, price: lastExtremeVal, confirmedAt: i });
+        direction = "up";
+        lastExtremeVal = v;
+        lastExtremeIdx = i;
+      }
+    }
+    pendingIdx[i] = lastExtremeIdx;
+    pendingVal[i] = lastExtremeVal;
+  }
+  return { confirmed, pendingIdx, pendingVal };
+}
+
 export function fibonacciLevels(low, high) {
   const range = high - low;
   const ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
@@ -214,13 +265,20 @@ const TIMEFRAME_PRESETS = {
     trendScoreThreshold: 2, trendAtrMultiplier: 2.5, trailMultiplier: 3.5,
   },
   // 횡보(단타) 모드 기본값(atrM=2, rr=0.8) 사용 시 목표폭이 손절폭보다 좁아 total=-96.70%로
-  // 심각하게 망가져 있었음(실측 n=718 wr=47.1%). scoreThreshold=4로 진입 품질을 높이고
-  // atrMultiplier=1.5/riskReward=1.8로 교정해 평균승(0.601%)>평균패(0.495%) 구조로
-  // 정상화, total도 -96.70%->+2.02%(n=38)로 개선. 다만 4시간봉 대비 개선폭이 작아
-  // 통계적으로 약한 신호이므로 향후 추가 데이터로 재검증 필요.
+  // 심각하게 망가져 있었음(실측 n=718 wr=47.1%, 21일치 데이터). scoreThreshold=4로 진입
+  // 품질을 높이고 atrMultiplier=1.5/riskReward=1.8로 교정해 total -96.70%->+2.02%(n=38)로
+  // 개선했으나 n이 작아 통계적으로 약하다고 판단, 데이터를 21일->60일(17,279봉/종목)로
+  // 보강 후 재검증(backtest() O(n^2)->O(n) 최적화 후 동일 결과 재현 확인 완료, 아래 참고).
+  // 보강된 데이터에서는 기존 atrM=1.5/rr=1.8이 오히려 total=-1.48%로 악화돼 rr을
+  // 0.8~5까지 넓게 그리드서치, atrMultiplier=1.8/riskReward=4.5가 total=+12.80%(n=121)로
+  // 최고였으나, 상위 3건의 거래를 제외하면 -0.77%로 역전돼(승률도 27.3%로 낮음) 소수
+  // 거래에 크게 의존하는 약한 신호임이 재확인됐다. 다만 시도한 모든 조합 중 exclTop3가
+  // 가장 양호하고(-0.77%, 다른 후보는 -1.02%~-7.11%) 종목별로도 20종목 중 12종목이
+  // 양수라 상대적으로는 가장 분산된 결과라 채택. 실거래 투입 시 5분봉 단타는 4시간봉
+  // 대비 신뢰도가 낮으므로 비중을 낮게 잡거나 추가 데이터로 지속 재검증 필요.
   fiveMin: {
     shortPeriod: 8, longPeriod: 21, scoreThreshold: 4,
-    atrMultiplier: 1.5, riskReward: 1.8,
+    atrMultiplier: 1.8, riskReward: 4.5,
     erTrendThreshold: 0.2, breakoutLookback: 20,
     trendScoreThreshold: 2, trendAtrMultiplier: 1.5, trailMultiplier: 1.5,
   },
@@ -231,30 +289,44 @@ function withTimeframePreset(opts) {
   return { ...preset, ...opts };
 }
 
-// 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
-export function generateSignal(prices, opts = {}, volumes = null) {
+// 지표 시계열 일괄 계산 — ema/rsi/atr/er/zigzag는 모두 과거 값만 참조하는 인과적(causal)
+// 계산이므로, 전체 가격 배열에 대해 한 번만 계산해두면 임의의 시점 i에서의 지표값이
+// prices.slice(0, i+1)로 매번 새로 계산한 것과 동일하다. backtest가 매 봉마다 전체 구간을
+// 잘라 모든 지표를 재계산하면 O(n^2)이 되어 데이터가 늘수록 기하급수적으로 느려지므로
+// (실측: 5분봉 데이터 3배 증가 시 그리드서치 1콤보당 소요시간이 9배로 증가), 시계열 전체를
+// 한 번만 계산해 인덱스로 조회하는 방식으로 O(n)에 맞춘다.
+function computeSeries(prices, volumes, opts) {
   const {
     shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
-    atrPeriod = 14, atrMultiplier = 2, riskReward = 0.8,
-    volumePeriod = 20, volumeMultiplier = 1.2,
-    scoreThreshold = 3, trendFilterPeriod = null,
-    erPeriod = 14, erTrendThreshold = 0.3, trailMultiplier = 1.5,
-    breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
-  } = withTimeframePreset(opts);
-  const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
-  if (prices.length < minNeeded) {
-    throw new Error(`신호 계산에 최소 ${minNeeded}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
-  }
+    atrPeriod = 14, erPeriod = 14, trendFilterPeriod = null, volumePeriod = 20,
+  } = opts;
+  return {
+    emaShort: ema(prices, shortPeriod),
+    emaLong: ema(prices, longPeriod),
+    rsiSeries: rsi(prices, rsiPeriod),
+    atrSeries: atr(prices, atrPeriod),
+    erSeries: efficiencyRatio(prices, erPeriod),
+    zz: zigzagPending(prices, zigzagPct),
+    emaLongTerm: trendFilterPeriod ? ema(prices, trendFilterPeriod) : null,
+    volAvg: volumes ? sma(volumes, volumePeriod) : null,
+  };
+}
 
-  const emaShort = ema(prices, shortPeriod);
-  const emaLong = ema(prices, longPeriod);
-  const rsiSeries = rsi(prices, rsiPeriod);
-  const atrSeries = atr(prices, atrPeriod);
-  const erSeries = efficiencyRatio(prices, erPeriod);
-  const pivots = zigzag(prices, zigzagPct);
+// series 기반 신호 계산: prices/series 전체를 그대로 두고 시점 last에서의 신호만 평가한다.
+function signalAt(prices, series, last, volumes, opts) {
+  const {
+    shortPeriod = 8, longPeriod = 21,
+    atrMultiplier = 2, riskReward = 0.8,
+    volumeMultiplier = 1.2,
+    scoreThreshold = 3, trendFilterPeriod = null,
+    erTrendThreshold = 0.3,
+    breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
+  } = opts;
+  const { emaShort, emaLong, rsiSeries, atrSeries, erSeries, zz, emaLongTerm, volAvg } = series;
+  const pivots = zz.confirmed.filter((p) => p.confirmedAt <= last);
+  pivots.push({ index: zz.pendingIdx[last], price: zz.pendingVal[last] });
   const wave = elliottWaveHint(pivots);
 
-  const last = prices.length - 1;
   const curPrice = prices[last];
   const curEmaShort = emaShort[last];
   const curEmaLong = emaLong[last];
@@ -309,7 +381,9 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   if (nearFibSupport) { score += 1; reasons.push("피보나치 지지선 근접"); }
   if (nearFibResistance) { score -= 1; reasons.push("피보나치 저항선 근접"); }
 
-  const volConfirmed = volumeConfirmed(volumes, volumePeriod, volumeMultiplier);
+  const volConfirmed = volumes && volAvg && volAvg[last] != null
+    ? volumes[last] > volAvg[last] * volumeMultiplier
+    : null;
   if (volConfirmed === true) {
     if (score > 0) { score += 1; reasons.push("거래량 동반 (신호 확인)"); }
     else if (score < 0) { score -= 1; reasons.push("거래량 동반 (신호 확인)"); }
@@ -323,7 +397,6 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   // 장기 추세 필터: 큰 흐름과 반대되는 신호는 걸러내 승률을 높인다 (역추세 매매 차단).
   let longTrendUp = null;
   if (trendFilterPeriod) {
-    const emaLongTerm = ema(prices, trendFilterPeriod);
     const curLongTerm = emaLongTerm[last];
     if (curLongTerm != null) {
       longTrendUp = curPrice > curLongTerm;
@@ -400,6 +473,23 @@ export function generateSignal(prices, opts = {}, volumes = null) {
   };
 }
 
+// 메인 신호 생성: 종가 시계열을 받아 결정론적 매매 신호를 반환
+export function generateSignal(prices, opts = {}, volumes = null) {
+  const resolved = withTimeframePreset(opts);
+  const { longPeriod = 21, trendFilterPeriod = null } = resolved;
+  const minNeeded = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
+  if (prices.length < minNeeded) {
+    throw new Error(`신호 계산에 최소 ${minNeeded}개 데이터 포인트가 필요합니다 (현재 ${prices.length}개)`);
+  }
+  const series = computeSeries(prices, volumes, {
+    shortPeriod: resolved.shortPeriod ?? 8, longPeriod: resolved.longPeriod ?? 21,
+    rsiPeriod: resolved.rsiPeriod ?? 14, zigzagPct: resolved.zigzagPct ?? 0.05,
+    atrPeriod: resolved.atrPeriod ?? 14, erPeriod: resolved.erPeriod ?? 14,
+    trendFilterPeriod, volumePeriod: resolved.volumePeriod ?? 20,
+  });
+  return signalAt(prices, series, prices.length - 1, volumes, resolved);
+}
+
 // 워크포워드 백테스트: 매수 신호 진입, (매도 신호 | 손절가 터치 | 목표가 터치) 시 청산.
 // 손절/목표가를 실제로 체결에 반영해야 ATR 기반 리스크관리 효과를 검증할 수 있다.
 //
@@ -434,7 +524,11 @@ export function backtest(prices, opts = {}, volumes = null) {
   let lastPosition = "관망";
   let entryIndex = null;
 
-  const atrSeries = atr(prices, atrPeriod);
+  const series = computeSeries(prices, volumes, {
+    shortPeriod, longPeriod, rsiPeriod, zigzagPct,
+    atrPeriod, erPeriod, trendFilterPeriod, volumePeriod,
+  });
+  const atrSeries = series.atrSeries;
 
   const closeTrade = (exitPrice, exitReason, exitIndex) => {
     const grossPct = (exitPrice - entryPrice) / entryPrice * 100 * leverage;
@@ -466,19 +560,12 @@ export function backtest(prices, opts = {}, volumes = null) {
       continue;
     }
 
-    const window = prices.slice(0, i + 1);
-    const volWindow = volumes ? volumes.slice(0, i + 1) : null;
-    let sig;
-    try {
-      sig = generateSignal(window, {
-        shortPeriod, longPeriod, rsiPeriod, zigzagPct,
-        atrPeriod, atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
-        volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold, trailMultiplier,
-        breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
-      }, volWindow);
-    } catch {
-      continue;
-    }
+    const sig = signalAt(prices, series, i, volumes, {
+      shortPeriod, longPeriod,
+      atrMultiplier, riskReward, scoreThreshold, trendFilterPeriod,
+      volumeMultiplier, erTrendThreshold, trailMultiplier,
+      breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
+    });
 
     if (!holding && sig.position === "매수") {
       holding = true;
