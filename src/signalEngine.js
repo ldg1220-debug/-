@@ -332,6 +332,7 @@ function signalAt(prices, series, last, volumes, opts) {
     volumeMultiplier = 1.2,
     trendFilterPeriod = null,
     trendFilterHard = false,
+    macroTrendUp = null,
     erTrendThreshold = 0.3,
     breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
   } = opts;
@@ -450,6 +451,24 @@ function signalAt(prices, series, last, volumes, opts) {
     }
   }
 
+  // 거시 레짐 자본배분 게이트: 개별 심볼 신호와 무관하게 BTC 등 시장 전체
+  // 추세(macroTrendUp[last])와 반대되는 진입을 차단한다. 개별 종목의
+  // trendFilterHard와 달리 "이 종목이 오르는가"가 아니라 "시장 전체가
+  // 우호적인가"를 묻는 것이라 알트코인이 일시적으로 자기 추세를 보여도
+  // 거시 국면이 불리하면 거래를 쉰다(자본배분 레이어).
+  if (macroTrendUp && position !== "관망") {
+    const macroUp = macroTrendUp[last];
+    if (macroUp != null) {
+      if (position === "매수" && !macroUp) {
+        reasons.push("거시레짐게이트: 시장 전체 하락추세 - 매수 차단");
+        position = "관망";
+      } else if (position === "매도" && macroUp) {
+        reasons.push("거시레짐게이트: 시장 전체 상승추세 - 매도 차단");
+        position = "관망";
+      }
+    }
+  }
+
   // ATR 기반 초기 손절: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
   // trendAtrMultiplier를 넓게 잡아야 진입 직후 흔들림에 바로 털리지 않고
   // 트레일링 스탑까지 갈 기회를 준다. 목표가는 정해두지 않고(null) 백테스트에서
@@ -516,7 +535,7 @@ export function backtest(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
     useStopLoss = true,
-    atrPeriod = 14, trendFilterPeriod, trendFilterHard = false,
+    atrPeriod = 14, trendFilterPeriod, trendFilterHard = false, macroTrendUp = null,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
@@ -588,7 +607,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     let sig;
     try {
       sig = signalAt(prices, series, i, volumes, {
-        shortPeriod, longPeriod, trendFilterPeriod, trendFilterHard,
+        shortPeriod, longPeriod, trendFilterPeriod, trendFilterHard, macroTrendUp,
         volumeMultiplier, erTrendThreshold,
         breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
       });
