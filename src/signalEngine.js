@@ -938,12 +938,15 @@ export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
       }
 
       if (holding) {
+        // 실제 종가(price)로 체결 처리 — stopPrice/targetPrice(이상적 체결가)로
+        // 기록하면 슬리피지/갭을 무시해 손실을 과소평가한다(B버킷 트레일링스탑에서
+        // 발견된 것과 동일한 버그, BACKTEST_BASELINE.md 참고).
         if (side === "long") {
-          if (price <= stopPrice) { closeTrade(stopPrice, "stop_loss", i, "박스권"); continue; }
-          if (price >= targetPrice) { closeTrade(targetPrice, "take_profit", i, "박스권"); continue; }
+          if (price <= stopPrice) { closeTrade(price, "stop_loss", i, "박스권"); continue; }
+          if (price >= targetPrice) { closeTrade(price, "take_profit", i, "박스권"); continue; }
         } else {
-          if (price >= stopPrice) { closeTrade(stopPrice, "stop_loss", i, "박스권"); continue; }
-          if (price <= targetPrice) { closeTrade(targetPrice, "take_profit", i, "박스권"); continue; }
+          if (price >= stopPrice) { closeTrade(price, "stop_loss", i, "박스권"); continue; }
+          if (price <= targetPrice) { closeTrade(price, "take_profit", i, "박스권"); continue; }
         }
       } else if (riskGuard.canTrade()) {
         const boxValid = (high - low) / low <= boxRangePct;
