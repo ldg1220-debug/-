@@ -496,7 +496,10 @@ export function backtest(prices, opts = {}, volumes = null) {
       if (curAtr != null) activeStop = Math.max(activeStop, highestSinceEntry - curAtr * trailMultiplier);
     }
     if (holding && useStopLoss && activeStop != null && prices[i] <= activeStop) {
-      closeTrade(activeStop, "trailing_stop", i);
+      // activeStop(이상적 스탑가)이 아닌 prices[i](실제 종가)로 체결 처리.
+      // 캔들 종가가 스탑선을 넘어 더 멀리 찍히는 경우가 잦아 activeStop 체결
+      // 가정은 손실을 체계적으로 과소평가함(박스권 백테스트에서 동일 버그 확인됨).
+      closeTrade(prices[i], "trailing_stop", i);
       continue;
     }
 
