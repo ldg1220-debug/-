@@ -64,6 +64,66 @@ export function efficiencyRatio(values, period = 14) {
   return out;
 }
 
+// 리스크 가드(서킷브레이커) — 전략 신호와 완전히 분리된 계좌 보호 레이어.
+// backtest()/boxBreakoutBacktest()의 트레이드 루프에 끼워 "거래 가능 여부"만
+// 판단한다. 신호의 승패 검증과는 무관하게 어떤 전략을 붙이든 동작한다.
+// 캘린더 일(day) 경계가 필요한 "당일 손실 한도"는 이 두 함수가 타임스탬프를
+// 받지 않아(인덱스 기반 종가 시계열만 받음) 구현하지 않음 — 대신 연속손절
+// 쿨다운과 MDD 하드정지(쿨다운 후 자동 재개)로 꼬리손실을 막는다.
+export function createRiskGuard(opts = {}) {
+  const {
+    riskGuardEnabled = false,
+    maxDrawdownLimit = 0.15,      // 고점 대비 이 낙폭(%) 도달 시 정지
+    mddCooldownBars = 40,         // MDD 정지 후 이만큼 바가 지나면 자동 재개
+    maxConsecutiveLosses = 5,     // 연속 손절 이 횟수 도달 시 쿨다운 진입
+    consecutiveCooldownBars = 20, // 연속손절 쿨다운 길이(바 수)
+  } = opts;
+  let equity = 1, peakEquity = 1;
+  let consecutiveLosses = 0, lossCooldownRemaining = 0;
+  let mddHalted = false, mddCooldownRemaining = 0;
+  const events = [];
+  return {
+    enabled: riskGuardEnabled,
+    onBarTick(index) {
+      if (!riskGuardEnabled) return;
+      if (lossCooldownRemaining > 0) lossCooldownRemaining--;
+      if (mddHalted) {
+        mddCooldownRemaining--;
+        if (mddCooldownRemaining <= 0) {
+          mddHalted = false;
+          events.push({ index, type: "mdd_resume" });
+        }
+      }
+    },
+    canTrade() {
+      if (!riskGuardEnabled) return true;
+      return !mddHalted && lossCooldownRemaining <= 0;
+    },
+    registerTrade(returnPct, index) {
+      if (!riskGuardEnabled) return;
+      equity *= 1 + returnPct / 100;
+      if (equity > peakEquity) peakEquity = equity;
+      const dd = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
+      if (!mddHalted && dd >= maxDrawdownLimit) {
+        mddHalted = true;
+        mddCooldownRemaining = mddCooldownBars;
+        events.push({ index, type: "mdd_halt", dd });
+      }
+      if (returnPct < 0) {
+        consecutiveLosses++;
+        if (consecutiveLosses >= maxConsecutiveLosses && lossCooldownRemaining <= 0) {
+          lossCooldownRemaining = consecutiveCooldownBars;
+          events.push({ index, type: "consecutive_loss_cooldown", count: consecutiveLosses });
+        }
+      } else {
+        consecutiveLosses = 0;
+      }
+    },
+    getEvents() { return events; },
+    getEquity() { return equity; },
+  };
+}
+
 // 거래량 확인 본체. volumes가 prices보다 짧을 수 있으므로(예: 거래량 데이터 누락)
 // last가 volumes 범위를 벗어나면 null을 반환해 인덱싱 오류를 막는다.
 function volumeConfirmedAt(volumes, volAvg, last, multiplier) {
@@ -452,7 +512,13 @@ export function backtest(prices, opts = {}, volumes = null) {
     // 절대 하지 않고 가격이 진입 방향으로 더 움직였을 때만(ATR 버퍼 이상
     // 유리하게 진행) 추가해 추세 구간에서의 수익을 증폭시킨다.
     pyramidEnabled = false, maxPyramidAdds = 2, pyramidAddFraction = 0.5,
+    riskGuardEnabled = false, maxDrawdownLimit, mddCooldownBars,
+    maxConsecutiveLosses, consecutiveCooldownBars,
   } = withTimeframePreset(opts);
+  const riskGuard = createRiskGuard({
+    riskGuardEnabled, maxDrawdownLimit, mddCooldownBars,
+    maxConsecutiveLosses, consecutiveCooldownBars,
+  });
   const minBars = Math.max(longPeriod, trendFilterPeriod || 0) + 2;
   const trades = [];
   let holding = false;
@@ -479,6 +545,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     const feePct = takerFeePct * (1 + totalWeight); // 진입(레그별 1회)+청산 1회, 모두 테이커
     const returnPct = grossPct - feePct;
     trades.push({ entryPrice: legs[0].price, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: "추세", feePct, pyramidAdds });
+    riskGuard.registerTrade(returnPct, exitIndex);
     holding = false;
     entryPrice = null;
     activeStop = null;
@@ -490,6 +557,7 @@ export function backtest(prices, opts = {}, volumes = null) {
   };
 
   for (let i = minBars; i < prices.length; i++) {
+    riskGuard.onBarTick(i);
     if (holding) {
       highestSinceEntry = Math.max(highestSinceEntry, prices[i]);
       const curAtr = atrSeries[i];
@@ -514,7 +582,7 @@ export function backtest(prices, opts = {}, volumes = null) {
       continue;
     }
 
-    if (!holding && sig.position === "매수") {
+    if (!holding && sig.position === "매수" && riskGuard.canTrade()) {
       holding = true;
       entryPrice = prices[i];
       entryIndex = i;
@@ -554,6 +622,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     totalReturnPct,
     buyHoldReturnPct,
     finalPosition: lastPosition,
+    riskGuardEvents: riskGuard.getEvents(),
   };
 }
 
@@ -655,6 +724,7 @@ export function momentumChaseBacktest(prices, opts = {}, volumes = null) {
     tradeCount: trades.length,
     winRate: trades.length ? (wins / trades.length) * 100 : 0,
     totalReturnPct,
+    riskGuardEvents: riskGuard.getEvents(),
   };
 }
 
@@ -783,7 +853,13 @@ export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
     breakoutTrailPct = 0.02,
     breakoutStopPct = 0.015,
     makerFeePct = 0.018, takerFeePct = 0.038, leverage = 1,
+    riskGuardEnabled = false, maxDrawdownLimit, mddCooldownBars,
+    maxConsecutiveLosses, consecutiveCooldownBars,
   } = opts;
+  const riskGuard = createRiskGuard({
+    riskGuardEnabled, maxDrawdownLimit, mddCooldownBars,
+    maxConsecutiveLosses, consecutiveCooldownBars,
+  });
 
   const minBars = Math.max(boxLookback, volumeAvgPeriod) + 1;
   const boxHigh = rollingExtreme(prices, boxLookback, (a, b) => a >= b);
@@ -804,12 +880,14 @@ export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
     const feePct = takerFeePct + exitFeePct;
     const returnPct = grossPct - feePct;
     trades.push({ entryPrice, exitPrice, entryIndex, exitIndex, returnPct, exitReason, regime: regimeLabel, feePct, side });
+    riskGuard.registerTrade(returnPct, exitIndex);
     holding = false;
     entryPrice = null; entryIndex = null; side = null;
     stopPrice = null; targetPrice = null; extremeSinceEntry = null;
   };
 
   for (let i = minBars; i < prices.length; i++) {
+    riskGuard.onBarTick(i);
     const price = prices[i];
     // i-1까지(현재 바 제외)의 박스 경계를 써야 "현재가가 박스를 벗어났는지"를
     // 판단할 수 있다 — i를 포함하면 현재가 자체가 항상 그 범위 안에 들어가
@@ -834,7 +912,7 @@ export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
           if (price >= stopPrice) { closeTrade(stopPrice, "stop_loss", i, "박스권"); continue; }
           if (price <= targetPrice) { closeTrade(targetPrice, "take_profit", i, "박스권"); continue; }
         }
-      } else {
+      } else if (riskGuard.canTrade()) {
         const boxValid = (high - low) / low <= boxRangePct;
         if (boxValid && price <= low * (1 + entryBufferPct)) {
           holding = true; side = "long"; entryPrice = price; entryIndex = i;
@@ -850,6 +928,7 @@ export function boxBreakoutBacktest(prices, opts = {}, volumes = null) {
       // BREAKOUT_LONG / BREAKOUT_SHORT
       const isLong = mode === "BREAKOUT_LONG";
       if (!holding) {
+        if (!riskGuard.canTrade()) { mode = "RANGE"; continue; }
         holding = true; side = isLong ? "long" : "short"; entryPrice = price; entryIndex = i;
         extremeSinceEntry = price;
       } else {
