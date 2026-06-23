@@ -331,6 +331,7 @@ function signalAt(prices, series, last, volumes, opts) {
     shortPeriod = DEFAULT_SHORT_PERIOD, longPeriod = DEFAULT_LONG_PERIOD,
     volumeMultiplier = 1.2,
     trendFilterPeriod = null,
+    trendFilterHard = false,
     erTrendThreshold = 0.3,
     breakoutLookback = 50, trendScoreThreshold = 2, trendAtrMultiplier = 2.5,
   } = opts;
@@ -436,6 +437,19 @@ function signalAt(prices, series, last, volumes, opts) {
     }
   }
 
+  // 하드 추세 게이트: trendFilterHard=true면 장기추세(EMA trendFilterPeriod)와
+  // 반대 방향 진입을 점수 보정이 아니라 완전히 차단한다. 4기간 검증에서 EMA150
+  // 기준으로 p3/p4가 양전환됨을 확인(BACKTEST_BASELINE.md "하드 추세게이트" 절 참고).
+  if (trendFilterHard && trendFilterPeriod && longTrendUp != null && position !== "관망") {
+    if (position === "매수" && !longTrendUp) {
+      reasons.push(`하드 추세게이트: 장기추세(EMA${trendFilterPeriod}) 하락 중 - 매수 차단`);
+      position = "관망";
+    } else if (position === "매도" && longTrendUp) {
+      reasons.push(`하드 추세게이트: 장기추세(EMA${trendFilterPeriod}) 상승 중 - 매도 차단`);
+      position = "관망";
+    }
+  }
+
   // ATR 기반 초기 손절: 변동성이 클수록 손절폭도 넓어진다 (정액 스윙 고저점 대신).
   // trendAtrMultiplier를 넓게 잡아야 진입 직후 흔들림에 바로 털리지 않고
   // 트레일링 스탑까지 갈 기회를 준다. 목표가는 정해두지 않고(null) 백테스트에서
@@ -502,7 +516,7 @@ export function backtest(prices, opts = {}, volumes = null) {
   const {
     shortPeriod = 8, longPeriod = 21, rsiPeriod = 14, zigzagPct = 0.05,
     useStopLoss = true,
-    atrPeriod = 14, trendFilterPeriod,
+    atrPeriod = 14, trendFilterPeriod, trendFilterHard = false,
     volumePeriod, volumeMultiplier, erPeriod, erTrendThreshold,
     trailMultiplier = 1.5, takerFeePct = 0.038, leverage = 1,
     breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
@@ -574,7 +588,7 @@ export function backtest(prices, opts = {}, volumes = null) {
     let sig;
     try {
       sig = signalAt(prices, series, i, volumes, {
-        shortPeriod, longPeriod, trendFilterPeriod,
+        shortPeriod, longPeriod, trendFilterPeriod, trendFilterHard,
         volumeMultiplier, erTrendThreshold,
         breakoutLookback, trendScoreThreshold, trendAtrMultiplier,
       });
