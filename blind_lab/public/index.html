@@ -9,8 +9,8 @@
   #progress { font-size:14px; color:#aaa; margin-bottom:6px; }
   #meta { font-size:13px; color:#888; margin-bottom:8px; }
   canvas { background:#161a23; border-radius:6px; display:block; width:100%; }
-  #mainCanvas { height: 360px; }
-  #volCanvas { height: 100px; margin-top:4px; }
+  #mainCanvas { height: 460px; }
+  #volCanvas { height: 120px; margin-top:4px; }
   .panel { margin-bottom:14px; }
   .actions { display:flex; gap:10px; margin:14px 0; }
   button.act { flex:1; padding:14px; font-size:16px; font-weight:bold; border:none; border-radius:8px; cursor:pointer; }
@@ -131,15 +131,26 @@ function fitCanvas(canvas) {
   return { ctx, w: rect.width, h: rect.height };
 }
 
+const RENDER_WINDOW = 220; // 보유 중 캔들이 늘어나도 폭이 일정하게 유지되도록 최근 N개만 렌더링
+
 function drawChart(data, entryIdx) {
-  const n = data.closes.length;
+  const nAll = data.closes.length;
+  const start = Math.max(0, nAll - RENDER_WINDOW);
+  const n = nAll - start;
   const mainCanvas = document.getElementById("mainCanvas");
   const volCanvas = document.getElementById("volCanvas");
   const { ctx, w, h } = fitCanvas(mainCanvas);
   const { ctx: vctx, w: vw, h: vh } = fitCanvas(volCanvas);
 
-  const ma5 = sma(data.closes, 5);
-  const ma100 = sma(data.closes, 100);
+  // MA는 잘려나간 과거분까지 포함한 전체 데이터 기준으로 계산(워밍업 목적), 그리기만 최근 구간으로 제한
+  const ma5Full = sma(data.closes, 5);
+  const ma100Full = sma(data.closes, 100);
+  const ma5 = ma5Full.slice(start);
+  const ma100 = ma100Full.slice(start);
+  const closes = data.closes.slice(start);
+  const highs = data.highs.slice(start);
+  const lows = data.lows.slice(start);
+  const localEntryIdx = entryIdx != null ? entryIdx - start : null;
 
   const padL = 8, padR = 8, padT = 8, padB = 8;
   const plotW = w - padL - padR;
@@ -148,8 +159,8 @@ function drawChart(data, entryIdx) {
 
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < n; i++) {
-    lo = Math.min(lo, data.lows[i]);
-    hi = Math.max(hi, data.highs[i]);
+    lo = Math.min(lo, lows[i]);
+    hi = Math.max(hi, highs[i]);
   }
   const range = (hi - lo) || 1;
   const yOf = (price) => padT + plotH - ((price - lo) / range) * plotH;
@@ -158,20 +169,20 @@ function drawChart(data, entryIdx) {
 
   for (let i = 0; i < n; i++) {
     const x = padL + i * barW + barW / 2;
-    const isFuture = entryIdx != null && i > entryIdx;
-    const bullish = data.closes[i] >= (i > 0 ? data.closes[i - 1] : data.closes[i]);
+    const isFuture = localEntryIdx != null && i > localEntryIdx;
+    const bullish = closes[i] >= (i > 0 ? closes[i - 1] : closes[i]);
     const color = isFuture ? (bullish ? "#3a8f6f" : "#a85050") : (bullish ? "#26a65b" : "#e74c3c");
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.globalAlpha = isFuture ? 0.6 : 1.0;
     ctx.beginPath();
-    ctx.moveTo(x, yOf(data.highs[i]));
-    ctx.lineTo(x, yOf(data.lows[i]));
+    ctx.moveTo(x, yOf(highs[i]));
+    ctx.lineTo(x, yOf(lows[i]));
     ctx.stroke();
     const bw = Math.max(1, barW * 0.6);
-    const openApprox = i > 0 ? data.closes[i - 1] : data.closes[i];
-    const yTop = yOf(Math.max(openApprox, data.closes[i]));
-    const yBot = yOf(Math.min(openApprox, data.closes[i]));
+    const openApprox = i > 0 ? closes[i - 1] : closes[i];
+    const yTop = yOf(Math.max(openApprox, closes[i]));
+    const yBot = yOf(Math.min(openApprox, closes[i]));
     ctx.fillRect(x - bw / 2, yTop, bw, Math.max(1, yBot - yTop));
   }
   ctx.globalAlpha = 1.0;
@@ -192,8 +203,8 @@ function drawChart(data, entryIdx) {
   drawLine(ma5, "#f5c542");
   drawLine(ma100, "#5b9dff");
 
-  if (entryIdx != null && entryIdx < n - 1) {
-    const x = padL + entryIdx * barW + barW;
+  if (localEntryIdx != null && localEntryIdx >= 0 && localEntryIdx < n - 1) {
+    const x = padL + localEntryIdx * barW + barW;
     ctx.strokeStyle = "#fff";
     ctx.setLineDash([4, 3]);
     ctx.beginPath();
@@ -208,16 +219,17 @@ function drawChart(data, entryIdx) {
   ctx.fillStyle = "#5b9dff"; ctx.fillRect(padL + 50, 4, 10, 3);
   ctx.fillStyle = "#ccc"; ctx.fillText("100MA", padL + 64, 10);
 
+  const volumes = data.volumes.slice(start);
   vctx.clearRect(0, 0, vw, vh);
   let maxVol = 0;
-  for (let i = 0; i < n; i++) maxVol = Math.max(maxVol, data.volumes[i] || 0);
+  for (let i = 0; i < n; i++) maxVol = Math.max(maxVol, volumes[i] || 0);
   const vPlotH = vh - 8;
   for (let i = 0; i < n; i++) {
     const x = padL + i * barW + barW / 2;
-    const isFuture = entryIdx != null && i > entryIdx;
-    const bullish = data.closes[i] >= (i > 0 ? data.closes[i - 1] : data.closes[i]);
+    const isFuture = localEntryIdx != null && i > localEntryIdx;
+    const bullish = closes[i] >= (i > 0 ? closes[i - 1] : closes[i]);
     vctx.fillStyle = isFuture ? "rgba(150,180,200,0.5)" : (bullish ? "rgba(38,166,91,0.8)" : "rgba(231,76,60,0.8)");
-    const bh = maxVol > 0 ? (data.volumes[i] / maxVol) * vPlotH : 0;
+    const bh = maxVol > 0 ? (volumes[i] / maxVol) * vPlotH : 0;
     const bw = Math.max(1, barW * 0.6);
     vctx.fillRect(x - bw / 2, vh - 4 - bh, bw, bh);
   }
@@ -283,6 +295,7 @@ function showTagsFor(action) {
   document.getElementById("entryActions").style.display = "none";
   document.getElementById("stepActions").style.display = "none";
   document.getElementById("reduceBox").style.display = "none";
+  document.getElementById("result").style.display = "none";
   document.getElementById("tagsBox").style.display = "block";
   resetTagsUI();
 }
@@ -295,6 +308,7 @@ document.getElementById("btnHold").onclick = async () => {
   if (json.error) { document.getElementById("errMsg").textContent = json.error; return; }
   if (json.finalized) { showFinalResult(json.record); return; }
   // 관망 유지: 캔들 1개만 더 보고 다시 매수/매도/관망 판단
+  document.getElementById("result").style.display = "none";
   visible.times.push(json.newBar.time);
   visible.highs.push(json.newBar.high);
   visible.lows.push(json.newBar.low);
@@ -366,6 +380,10 @@ function handleStepResponse(json, wasReduce) {
     return;
   }
   if (json.finalized) {
+    if (json.caseOver === false) {
+      showRoundResult(json.record);
+      return;
+    }
     showFinalResult(json.record, json.forcedClose || json.forcedAtEntry);
     return;
   }
@@ -411,6 +429,28 @@ function showFinalResult(record, forced) {
 }
 
 document.getElementById("nextBtn").onclick = loadNext;
+
+function showRoundResult(record) {
+  document.getElementById("tagsBox").style.display = "none";
+  document.getElementById("reduceBox").style.display = "none";
+  document.getElementById("stepActions").style.display = "none";
+  position = null;
+  renderPosPanel();
+
+  const exitsHtml = record.exits.map(e =>
+    `진입대비 ${e.barOffset}봉째, 비중 ${e.size}, 가격 ${e.price.toFixed(6)} → ${e.retPct.toFixed(3)}%`
+  ).join("<br>");
+  const resultBox = document.getElementById("result");
+  resultBox.style.display = "block";
+  resultBox.innerHTML = `
+    <b>${record.action === "buy" ? "매수" : "매도"}</b> 거래 종료 (진입 ${record.numLegs}회/총비중 ${record.totalEntrySize}, 정리 ${record.numExits}회) — 같은 차트에서 계속 진행 가능<br>
+    가중평균 실현 수익률(수수료 차감 후): <b style="color:${record.retPct >= 0 ? '#2ecc71' : '#e74c3c'}">${record.retPct.toFixed(3)}%</b><br>
+    MFE(최대유리): ${record.mfe.toFixed(3)}%  /  MAE(최대불리): ${record.mae.toFixed(3)}%<br>
+    <div style="margin-top:6px;font-size:13px;color:#aaa;">${exitsHtml}</div>
+  `;
+  document.getElementById("nextBtn").style.display = "none";
+  document.getElementById("entryActions").style.display = "flex";
+}
 
 loadNext();
 </script>

@@ -248,15 +248,21 @@ const server = http.createServer(async (req, res) => {
         applyExit(session, idx, Math.min(size, session.openSize));
         if (session.openSize <= EPS) {
           const record = buildFinalRecord(session);
-          session = null;
-          send(res, 200, { finalized: true, record });
+          const reachedEndNow = idx + 1 > c.tLocal + c.h;
+          if (reachedEndNow) { session = null; send(res, 200, { finalized: true, record, caseOver: true }); return; }
+          session.direction = null; session.legs = []; session.exits = []; session.openSize = 0;
+          session.mfe = 0; session.mae = 0; session.status = "awaiting_entry";
+          send(res, 200, { finalized: true, record, caseOver: false });
           return;
         }
       } else if (payload.choice === "close") {
         applyExit(session, idx, session.openSize);
         const record = buildFinalRecord(session);
-        session = null;
-        send(res, 200, { finalized: true, record });
+        const reachedEndNow = idx + 1 > c.tLocal + c.h;
+        if (reachedEndNow) { session = null; send(res, 200, { finalized: true, record, caseOver: true }); return; }
+        session.direction = null; session.legs = []; session.exits = []; session.openSize = 0;
+        session.mfe = 0; session.mae = 0; session.status = "awaiting_entry";
+        send(res, 200, { finalized: true, record, caseOver: false });
         return;
       } else if (payload.choice !== "hold") {
         send(res, 400, { error: "invalid choice" }); return;
