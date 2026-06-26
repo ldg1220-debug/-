@@ -1,6 +1,9 @@
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const decisions = JSON.parse(fs.readFileSync("/tmp/blind_lab/decisions.json", "utf8"));
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const decisions = JSON.parse(fs.readFileSync(`${ROOT}/decisions.json`, "utf8"));
 const traded = decisions.filter(d => d.action === "buy" || d.action === "sell");
 
 function stats(arr) {
