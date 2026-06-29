@@ -25,7 +25,8 @@ function pickNextCase() {
   const decisions = loadDecisions();
   const doneOrders = new Set(decisions.map(d => d.order));
   const remaining = CASES.filter(c => !doneOrders.has(c.order)).sort((a, b) => a.order - b.order);
-  return { remaining, completed: decisions.length };
+  // 재진입으로 한 케이스에 기록이 여러 건 쌓일 수 있어, 진행률은 "완료한 케이스 수"(고유 order 수) 기준으로 센다.
+  return { remaining, completed: doneOrders.size };
 }
 
 function visibleSlice(c, uptoIdx) {
