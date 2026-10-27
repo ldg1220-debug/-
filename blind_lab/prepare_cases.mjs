@@ -18,7 +18,6 @@ const SOURCES = [
   { tf: "4h", dir: `${ROOT}/raw_data/edgex_4h_continuous` },
   { tf: "1d", dir: `${ROOT}/raw_data/edgex_1d_continuous` },
 ];
-const QUOTA_PER_TF = Math.floor(N_CASES / SOURCES.length); // 타임프레임별 균등 쿼터
 
 function mulberry32(seed) {
   return function () {
@@ -33,7 +32,7 @@ const rand = mulberry32(Date.now() ^ Math.floor(Math.random() * 0xffffffff));
 
 const poolByTf = {};
 for (const { tf, dir } of SOURCES) {
-  const syms = fs.readdirSync(dir).map(f => f.replace(".json", ""));
+  const syms = fs.existsSync(dir) ? fs.readdirSync(dir).map(f => f.replace(".json", "")) : [];
   poolByTf[tf] = [];
   for (const sym of syms) {
     const d = JSON.parse(fs.readFileSync(`${dir}/${sym}.json`, "utf8"));
@@ -45,9 +44,11 @@ for (const { tf, dir } of SOURCES) {
   }
 }
 
-for (const { tf } of SOURCES) {
-  if (!poolByTf[tf].length) { console.error(`${tf} 가용 데이터 없음`); process.exit(1); }
-}
+// 데이터가 부족한 타임프레임(예: 거래소 일봉 히스토리가 짧은 경우)은 건너뛰고 나머지에 쿼터를 배분한다.
+const ACTIVE = SOURCES.filter(({ tf }) => poolByTf[tf].length);
+for (const { tf } of SOURCES) if (!poolByTf[tf].length) console.warn(`[경고] ${tf} 가용 데이터 없음 — 이 타임프레임은 제외하고 진행`);
+if (!ACTIVE.length) { console.error("가용 데이터가 있는 타임프레임이 없음 — node fetch_data.mjs 를 먼저 실행하세요"); process.exit(1); }
+const quotaOf = (i) => Math.floor(N_CASES / ACTIVE.length) + (i < N_CASES % ACTIVE.length ? 1 : 0);
 
 function shuffle(arr) {
   const a = arr.slice();
@@ -59,7 +60,8 @@ function shuffle(arr) {
 }
 
 const cases = [];
-for (const { tf } of SOURCES) {
+for (const [ti, { tf }] of ACTIVE.entries()) {
+  const QUOTA_PER_TF = quotaOf(ti);
   const pool = poolByTf[tf];
   // 같은 종목이 다른 종목들보다 먼저 두 번 뽑히지 않도록, 셔플된 종목 순서를 한 바퀴씩 다 쓰고 나서야 다음 바퀴(반복)를 시작한다.
   let cycle = shuffle(pool);

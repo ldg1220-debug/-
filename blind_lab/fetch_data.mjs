@@ -9,16 +9,23 @@ import { fileURLToPath } from "url";
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RAW_DIR = `${ROOT}/raw_data`;
 
-const META = "https://pro.edgex.exchange/api/v1/public/meta/getMetaData";
-const TICKER = "https://pro.edgex.exchange/api/v1/public/quote/getTicker";
-const KLINE = "https://pro.edgex.exchange/api/v1/public/quote/getKline";
+const API = "https://edgex-prod-v2.edgex.exchange/api/v2/public";
+const META = `${API}/meta/getMetaData`;
+const TICKER = `${API}/quote/getTicker`;
+const KLINE = `${API}/quote/getKline`;
+
+async function getJson(url) {
+  const res = await fetch(url);
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error(`JSON이 아닌 응답(HTTP ${res.status}) — API 주소 변경/네트워크 차단 가능성: ${url}\n${text.slice(0, 120)}`); }
+}
 
 const NON_CRYPTO = new Set(["XAUT","SILVER","CL","COPPER","NATGAS","PAXG","INTC","QQQ","SPY","CRCL","GOOG","NVDA","MSTR","COIN","AMD","TSLA","AAPL","META","AMZN","MSFT","NFLX","HOOD","PLTR","AVGO"]);
 const N_SYMBOLS = Number(process.argv[2] || 30); // 거래량 상위 N개 종목 사용
 
 async function pickTopSymbols(n) {
-  const metaRes = await fetch(META);
-  const meta = await metaRes.json();
+  const meta = await getJson(META);
   const contracts = meta.data.contractList || meta.data.contracts || [];
   const results = [];
   for (const c of contracts) {
@@ -26,8 +33,7 @@ async function pickTopSymbols(n) {
     if (!symbol || NON_CRYPTO.has(symbol)) continue;
     if (c.enableTrade === false || c.enableDisplay === false) continue;
     try {
-      const tRes = await fetch(`${TICKER}?contractId=${c.contractId}`);
-      const t = await tRes.json();
+      const t = await getJson(`${TICKER}?contractId=${c.contractId}`);
       const vol = Number(t.data?.[0]?.value || 0);
       if (vol > 0) results.push({ symbol, contractId: c.contractId, vol });
     } catch (e) { /* 일시 오류 종목은 건너뜀 */ }
@@ -41,8 +47,7 @@ async function fetchKlines(contractId, klineType, sinceMs, untilMs) {
   let offsetData = "";
   while (true) {
     const url = `${KLINE}?contractId=${contractId}&klineType=${klineType}&size=1000&priceType=LAST_PRICE&filterBeginKlineTimeInclusive=${sinceMs}&filterEndKlineTimeExclusive=${untilMs}${offsetData ? `&offsetData=${offsetData}` : ""}`;
-    const res = await fetch(url);
-    const j = await res.json();
+    const j = await getJson(url);
     if (j.code !== "SUCCESS") throw new Error(JSON.stringify(j));
     const list = j.data.dataList;
     all.push(...list);
