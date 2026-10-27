@@ -57,3 +57,19 @@ node analyze.mjs           # decisions.json 누적 후 그룹/태그/타임프�
 - 1d: 365봉 이상 필요(워밍업 105 + 표시 200 + 정산 60)라서 최근 상장된 종목은 대부분
   제외되고 실사용 가능 종목이 10~15개 수준으로 적다. 거래소 자체에 더 긴 일봉 히스토리가
   쌓이기 전까지는 구조적 한계.
+
+## 새 컴퓨터에서 쉽게 실행 (Windows)
+
+```
+git clone https://github.com/ldg1220-debug/-
+cd -
+git checkout claude/zen-keller-y4iatt
+```
+
+이후 `blind_lab` 폴더에서 배치 파일을 더블클릭:
+
+- `시작.bat` — 데이터/케이스가 없으면 자동 생성 후 서버 실행 (http://localhost:8731)
+- `새차트.bat` — decisions.json 백업 후 새 차트 셋 생성 + 기록 초기화
+- `외부공개.bat` — cloudflared 설치(없을 때) 및 외부 접속용 터널 실행 (서버를 먼저 켜둘 것)
+
+Node.js가 설치되어 있어야 한다.
